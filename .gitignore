@@ -10,4 +10,5 @@ build/
 *.egg-info/
 worker.log
 api.log
+dev_local.*.log
 .temporal/

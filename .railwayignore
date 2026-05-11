@@ -5,6 +5,6 @@ __pycache__
 .mypy_cache
 .ruff_cache
 .env
+*.log
 tests
 docs/*.png
-

@@ -8,7 +8,8 @@ Create these services in the same Railway project:
 
 1. `temporal-postgres`
    - Railway PostgreSQL plugin/service.
-   - Use a dedicated database for Temporal if possible.
+   - Prefer a dedicated PostgreSQL service for Temporal, separate from the
+     Evolution API database.
 
 2. `temporal-server`
    - Root directory: `railway/temporal-server`
@@ -17,6 +18,7 @@ Create these services in the same Railway project:
 
 3. `dsg-temporal-api`
    - Root directory: project root.
+   - Build: root `Dockerfile`.
    - Public domain enabled.
    - Healthcheck path: `/health`.
    - Variables:
@@ -28,6 +30,7 @@ Create these services in the same Railway project:
 
 4. `dsg-temporal-worker`
    - Root directory: project root.
+   - Build: root `Dockerfile`.
    - No public domain required.
    - No HTTP healthcheck.
    - Variables:
@@ -55,14 +58,18 @@ DB_PORT=${{temporal-postgres.PGPORT}}
 POSTGRES_SEEDS=${{temporal-postgres.PGHOST}}
 POSTGRES_USER=${{temporal-postgres.PGUSER}}
 POSTGRES_PWD=${{temporal-postgres.PGPASSWORD}}
-DBNAME=${{temporal-postgres.PGDATABASE}}
-VISIBILITY_POSTGRES_SEEDS=${{temporal-postgres.PGHOST}}
-VISIBILITY_POSTGRES_USER=${{temporal-postgres.PGUSER}}
-VISIBILITY_POSTGRES_PWD=${{temporal-postgres.PGPASSWORD}}
-VISIBILITY_DB_PORT=${{temporal-postgres.PGPORT}}
-VISIBILITY_DBNAME=${{temporal-postgres.PGDATABASE}}
+DBNAME=temporal
+VISIBILITY_DBNAME=temporal_visibility
 POSTGRES_TLS_ENABLED=true
 POSTGRES_TLS_DISABLE_HOST_VERIFICATION=true
+```
+
+`temporalio/auto-setup` will try to create `temporal` and
+`temporal_visibility`. If Railway denies database creation, create both
+databases manually in the PostgreSQL service, then redeploy with:
+
+```text
+SKIP_DB_CREATE=true
 ```
 
 If your Railway Postgres is only reachable through the private network without

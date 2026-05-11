@@ -10,5 +10,4 @@ COPY src ./src
 
 RUN python -m pip install --no-cache-dir .
 
-CMD ["python", "-m", "dsg_temporal.worker"]
-
+CMD ["python", "-m", "dsg_temporal.railway_start"]

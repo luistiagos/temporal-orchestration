@@ -1,8 +1,0 @@
-[build]
-builder = "DOCKERFILE"
-dockerfilePath = "Dockerfile"
-
-[deploy]
-startCommand = "python -m dsg_temporal.railway_start"
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 10
