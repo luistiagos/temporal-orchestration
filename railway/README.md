@@ -11,7 +11,8 @@ Create these services in the same Railway project:
    - Prefer a dedicated PostgreSQL service for Temporal, separate from the
      Evolution API database.
 
-2. `temporal-server`
+2. `temporal-serve`
+   - Railway service name: `temporal-serve`
    - Root directory: `railway/temporal-server`
    - No public domain required.
    - Exposes Temporal gRPC on port `7233`.
@@ -23,7 +24,7 @@ Create these services in the same Railway project:
    - Healthcheck path: `/health`.
    - Variables:
      - `SERVICE_ROLE=api`
-     - `TEMPORAL_ADDRESS=${{temporal-server.RAILWAY_PRIVATE_DOMAIN}}:7233`
+     - `TEMPORAL_ADDRESS=${{temporal-serve.RAILWAY_PRIVATE_DOMAIN}}:7233`
      - `TEMPORAL_NAMESPACE=default`
      - `TEMPORAL_TASK_QUEUE=dsg-orchestrator`
      - `DRY_RUN=true` initially
@@ -35,7 +36,7 @@ Create these services in the same Railway project:
    - No HTTP healthcheck.
    - Variables:
      - `SERVICE_ROLE=worker`
-     - `TEMPORAL_ADDRESS=${{temporal-server.RAILWAY_PRIVATE_DOMAIN}}:7233`
+     - `TEMPORAL_ADDRESS=${{temporal-serve.RAILWAY_PRIVATE_DOMAIN}}:7233`
      - `TEMPORAL_NAMESPACE=default`
      - `TEMPORAL_TASK_QUEUE=dsg-orchestrator`
      - `DRY_RUN=true` initially
@@ -45,11 +46,16 @@ Create these services in the same Railway project:
    - Public domain can be enabled, preferably protected by Railway access controls
      or a private team-only network.
    - Variables:
-     - `TEMPORAL_ADDRESS=${{temporal-server.RAILWAY_PRIVATE_DOMAIN}}:7233`
+     - `TEMPORAL_ADDRESS=${{temporal-serve.RAILWAY_PRIVATE_DOMAIN}}:7233`
+
+If you rename the Railway service, update every reference above to use the exact
+service name. Railway reference variables use the service name as the namespace,
+so `${{temporal-server.RAILWAY_PRIVATE_DOMAIN}}` resolves empty if the service is
+actually named `temporal-serve`.
 
 ## Temporal Server variables
 
-For the `temporal-server` service, set these variables from the Railway Postgres
+For the `temporal-serve` service, set these variables from the Railway Postgres
 service:
 
 ```text

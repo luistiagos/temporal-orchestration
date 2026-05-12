@@ -88,7 +88,10 @@ For Railway, deploy the same project root twice:
 - Worker service with `SERVICE_ROLE=worker`
 
 Deploy Temporal Server from `railway/temporal-server` and point it at Railway
-PostgreSQL. Keep the Temporal Server and worker private; expose only the API.
+PostgreSQL. In the current Railway setup, the service is named
+`temporal-serve`, so service references use
+`${{temporal-serve.RAILWAY_PRIVATE_DOMAIN}}:7233`. Keep the Temporal Server and
+worker private; expose only the API.
 
 ## Main endpoints
 
