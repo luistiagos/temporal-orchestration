@@ -200,7 +200,11 @@ async def ingest_whatsapp_message(
     request: Request,
 ) -> dict[str, str]:
     settings = get_settings()
-    conversation_id = canonical_phone(payload.jid) or payload.jid
+    conversation_id = (
+        canonical_phone(payload.jid)
+        or canonical_phone(payload.jid_alt)
+        or payload.jid
+    )
     workflow_id = whatsapp_workflow_id(payload.tenant_id, conversation_id)
     message = payload.inbound_message()
     workflow_input = WhatsAppWorkflowInput(

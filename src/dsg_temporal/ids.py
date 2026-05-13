@@ -18,7 +18,10 @@ def safe_id(value: object, fallback: str = "unknown") -> str:
 def canonical_phone(raw: str | None) -> str:
     if not raw:
         return ""
-    return re.sub(r"\D+", "", raw)
+    text = str(raw).strip().lower()
+    if "@lid" in text or "@g.us" in text or "broadcast" in text:
+        return ""
+    return re.sub(r"\D+", "", text)
 
 
 def remarketing_workflow_id(
@@ -55,4 +58,3 @@ def remarketing_idempotency_key(
             str(cycle),
         ]
     )
-
