@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
+from urllib.parse import urljoin
 
 import requests
 from temporalio import activity
@@ -16,6 +18,38 @@ from dsg_temporal.schemas import (
 from dsg_temporal.settings import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _legacy_remarketing_headers(idempotency_key: str | None = None) -> dict[str, str]:
+    settings = get_settings()
+    headers = {"User-Agent": "dsg-temporal-remarketing/0.1"}
+    if settings.legacy_api_key:
+        headers["Authorization"] = f"Bearer {settings.legacy_api_key}"
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+        headers["X-Idempotency-Key"] = idempotency_key
+    return headers
+
+
+def _legacy_remarketing_get(
+    path: str,
+    payload: dict[str, Any],
+    *,
+    idempotency_key: str | None = None,
+) -> requests.Response:
+    settings = get_settings()
+    url = urljoin(settings.legacy_backend_base_url + "/", path.lstrip("/"))
+    params = {
+        key: value
+        for key, value in payload.items()
+        if value is not None and not isinstance(value, (dict, list, tuple))
+    }
+    return requests.get(
+        url,
+        params=params,
+        headers=_legacy_remarketing_headers(idempotency_key),
+        timeout=settings.http_timeout_seconds,
+    )
 
 
 @activity.defn
@@ -35,7 +69,7 @@ def check_purchase(payload: PurchaseCheckInput) -> PurchaseCheckResult:
         "metadata": payload.metadata,
     }
     try:
-        response = post_legacy_json(settings.legacy_purchase_check_path, body)
+        response = _legacy_remarketing_get(settings.legacy_purchase_check_path, body)
         raw = response_json_or_raw(response)
         if response.status_code >= 400:
             reason = f"purchase check http {response.status_code}"
@@ -93,7 +127,11 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
         )
 
     try:
-        response = post_legacy_json(path, body, idempotency_key=payload.idempotency_key)
+        response = _legacy_remarketing_get(
+            path,
+            body,
+            idempotency_key=payload.idempotency_key,
+        )
     except requests.Timeout as exc:
         return DispatchResult(
             status="unknown",
@@ -143,4 +181,3 @@ def notify_remarketing_event(payload: NotifyRemarketingEventInput) -> None:
             logger.warning("event callback failed with http %s", response.status_code)
     except Exception:
         logger.exception("event callback failed")
-

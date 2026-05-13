@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict, is_dataclass
 import logging
 
 import requests
@@ -10,6 +11,14 @@ from dsg_temporal.schemas import WhatsAppBatchInput, WhatsAppBatchResult
 from dsg_temporal.settings import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _message_to_dict(message):
+    if is_dataclass(message):
+        return asdict(message)
+    if isinstance(message, dict):
+        return message
+    return dict(message)
 
 
 @activity.defn
@@ -24,7 +33,7 @@ def process_whatsapp_batch(payload: WhatsAppBatchInput) -> WhatsAppBatchResult:
     body = {
         "tenant_id": payload.tenant_id,
         "conversation_id": payload.conversation_id,
-        "messages": payload.messages,
+        "messages": [_message_to_dict(message) for message in payload.messages],
         "metadata": payload.metadata,
     }
     try:
@@ -40,4 +49,3 @@ def process_whatsapp_batch(payload: WhatsAppBatchInput) -> WhatsAppBatchResult:
     if response.status_code == 409:
         return WhatsAppBatchResult(status="duplicate", raw=raw)
     raise RuntimeError(f"whatsapp batch http {response.status_code}: {raw}")
-

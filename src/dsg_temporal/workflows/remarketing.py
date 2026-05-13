@@ -67,19 +67,36 @@ class LeadRemarketingWorkflow:
         unlimited = max_cycles <= 0
         cycle = 1
         cycle_anchor = parse_iso_datetime(payload.lead_created_at_iso) or workflow.now()
+        last_dispatched_at_by_step: dict[str, Any] = {}
 
         while unlimited or cycle <= max_cycles:
+            cycle_sequence = sequence
+            if cycle > 1:
+                cycle_sequence = [
+                    step
+                    for step in sequence
+                    if step.repeat_after_days and step.repeat_after_days > 0
+                ]
+                if not cycle_sequence:
+                    break
+
             self._state.current_cycle = cycle
-            for step in sequence:
+            for step in cycle_sequence:
                 if await self._stop_if_requested():
                     return self._state
 
                 self._state.current_step_id = step.step_id
                 self._state.status = "waiting"
+                base_at = cycle_anchor
+                delay_minutes = step.delay_minutes
+                if cycle > 1:
+                    base_at = last_dispatched_at_by_step.get(step.step_id, workflow.now())
+                    delay_minutes = int(step.repeat_after_days or 0) * 24 * 60
+                    delay_minutes += int(step.delay_minutes or 0)
                 due_at = compute_due_at(
                     now=workflow.now(),
-                    base_at=cycle_anchor,
-                    delay_minutes=step.delay_minutes,
+                    base_at=base_at,
+                    delay_minutes=delay_minutes,
                     send_at_iso=step.send_at_iso if cycle == 1 else None,
                     preferred_time=step.preferred_time,
                     preferred_day=step.preferred_day,
@@ -135,6 +152,7 @@ class LeadRemarketingWorkflow:
                             metadata=dispatch_result.raw,
                         )
                     )
+                    last_dispatched_at_by_step[step.step_id] = sent_at
                     self._state.status = "running"
                     self._add_event(
                         "step_dispatched",
@@ -151,14 +169,9 @@ class LeadRemarketingWorkflow:
                     self._state.status = "failed"
                     return self._state
 
-            repeat_after_days = [
-                int(step.repeat_after_days)
-                for step in sequence
-                if step.repeat_after_days and step.repeat_after_days > 0
-            ]
-            if not repeat_after_days and not unlimited and cycle >= max_cycles:
+            if not unlimited and cycle >= max_cycles:
                 break
-            cycle_anchor = workflow.now() + timedelta(days=min(repeat_after_days or [0]))
+            cycle_anchor = workflow.now()
             cycle += 1
 
         self._state.status = "completed"
