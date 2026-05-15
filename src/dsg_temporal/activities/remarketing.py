@@ -7,7 +7,7 @@ from urllib.parse import urljoin
 import requests
 from temporalio import activity
 
-from dsg_temporal.activities.http_client import post_legacy_json, response_json_or_raw
+from dsg_temporal.activities.http_client import response_json_or_raw
 from dsg_temporal.schemas import (
     DispatchResult,
     DispatchStepInput,
@@ -118,7 +118,7 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
     if channel == "email":
         path = settings.legacy_email_path
     elif channel == "whatsapp":
-        path = settings.legacy_whatsapp_path
+        path = settings.legacy_whatsapp_ai_path or settings.legacy_whatsapp_path
     else:
         return DispatchResult(
             status="failed",
@@ -175,8 +175,20 @@ def notify_remarketing_event(payload: NotifyRemarketingEventInput) -> None:
         "event": payload.event,
         "state": payload.state,
     }
+    url = urljoin(settings.legacy_backend_base_url + "/", settings.legacy_event_callback_path.lstrip("/"))
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "dsg-temporal-remarketing/0.1",
+    }
+    if settings.legacy_event_callback_secret:
+        headers["X-Callback-Secret"] = settings.legacy_event_callback_secret
     try:
-        response = post_legacy_json(settings.legacy_event_callback_path, body)
+        response = requests.post(
+            url,
+            json=body,
+            headers=headers,
+            timeout=settings.http_timeout_seconds,
+        )
         if response.status_code >= 400:
             logger.warning("event callback failed with http %s", response.status_code)
     except Exception:

@@ -88,8 +88,10 @@ class Settings:
     legacy_api_key: str
     legacy_email_path: str
     legacy_whatsapp_path: str
+    legacy_whatsapp_ai_path: str
     legacy_purchase_check_path: str
     legacy_event_callback_path: str
+    legacy_event_callback_secret: str
     legacy_whatsapp_process_path: str
     dry_run: bool
     assume_purchased_on_check_error: bool
@@ -112,11 +114,13 @@ def get_settings() -> Settings:
         legacy_api_key=_str_env("LEGACY_API_KEY", ""),
         legacy_email_path=_str_env("LEGACY_EMAIL_PATH", "/remarket_v2"),
         legacy_whatsapp_path=_str_env("LEGACY_WHATSAPP_PATH", "/remarket_whatsapp"),
+        legacy_whatsapp_ai_path=_str_env("LEGACY_WHATSAPP_AI_PATH", "/remarket_whatsapp_ai"),
         legacy_purchase_check_path=_str_env(
             "LEGACY_PURCHASE_CHECK_PATH",
             "/user_has_purchase",
         ),
         legacy_event_callback_path=_str_env("LEGACY_EVENT_CALLBACK_PATH", ""),
+        legacy_event_callback_secret=_str_env("LEGACY_EVENT_CALLBACK_SECRET", ""),
         legacy_whatsapp_process_path=_str_env(
             "LEGACY_WHATSAPP_PROCESS_PATH",
             "/temporal/whatsapp/process",
