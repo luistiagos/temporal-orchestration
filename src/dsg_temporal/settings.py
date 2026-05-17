@@ -99,6 +99,8 @@ class Settings:
     activity_max_workers: int
     whatsapp_min_interval_seconds: int
     email_min_interval_seconds: int
+    remarketing_whatsapp_enabled: bool
+    remarketing_email_override_to: str
 
 
 @lru_cache(maxsize=1)
@@ -139,4 +141,13 @@ def get_settings() -> Settings:
         # 90s (~40/h) é conservador e evita ban por volume. Email 10s.
         whatsapp_min_interval_seconds=_int_env("WHATSAPP_MIN_INTERVAL_SECONDS", 90),
         email_min_interval_seconds=_int_env("EMAIL_MIN_INTERVAL_SECONDS", 10),
+        # Defesa em profundidade: ainda que um workflow chegue com step de
+        # WhatsApp (planner antigo, replanejamento), só dispara se essa
+        # flag estiver explicitamente true. Default false após o ban de
+        # 2026-05-17.
+        remarketing_whatsapp_enabled=_bool_env("REMARKETING_WHATSAPP_ENABLED", False),
+        # Modo de teste: se preenchido, todo dispatch de email é redirecionado
+        # para este endereço (ignora o email do lead). Útil para validar o
+        # fluxo sem enviar para clientes reais. Vazio = comportamento normal.
+        remarketing_email_override_to=_str_env("REMARKETING_EMAIL_OVERRIDE_TO", ""),
     )

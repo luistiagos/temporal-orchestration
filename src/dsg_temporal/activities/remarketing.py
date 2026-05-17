@@ -141,6 +141,16 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
             reason="dry_run",
         )
 
+    # WhatsApp desabilitado até liberar novo chip — recusa o dispatch
+    # como skipped (não falha o workflow, só pula o step).
+    if channel == "whatsapp" and not settings.remarketing_whatsapp_enabled:
+        logger.info("whatsapp dispatch skipped (REMARKETING_WHATSAPP_ENABLED=false)")
+        return DispatchResult(
+            status="skipped",
+            retryable=False,
+            reason="whatsapp disabled by config",
+        )
+
     if channel == "whatsapp":
         min_interval = settings.whatsapp_min_interval_seconds
     elif channel == "email":
@@ -154,6 +164,17 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
             channel, waited, min_interval,
         )
 
+    # Modo de teste: redireciona TODOS os envios de email para um único
+    # endereço (configurado por REMARKETING_EMAIL_OVERRIDE_TO). Permite
+    # validar o pipeline em produção sem enviar para clientes reais.
+    dispatch_email = payload.email
+    if channel == "email" and settings.remarketing_email_override_to:
+        dispatch_email = settings.remarketing_email_override_to
+        logger.info(
+            "email override active: %s -> %s (test mode)",
+            payload.email, dispatch_email,
+        )
+
     body = {
         "tenant_id": payload.tenant_id,
         "lead_id": payload.lead_id,
@@ -162,7 +183,7 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
         "step_id": payload.step.step_id,
         "remarketstoreid": payload.step.metadata.get("remarket_store_id"),
         "idempotency_key": payload.idempotency_key,
-        "email": payload.email,
+        "email": dispatch_email,
         "phone": payload.phone,
         "title": payload.step.subject,
         "subject": payload.step.subject,
