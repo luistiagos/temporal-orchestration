@@ -258,9 +258,18 @@ def notify_remarketing_event(payload: NotifyRemarketingEventInput) -> None:
     if not settings.legacy_event_callback_path or settings.dry_run:
         return
 
+    # event vai como STRING (event_type) — é o que o endpoint legado consome
+    # com .strip(). O dict completo do evento vai em 'event_details'.
+    event_obj = _to_jsonable(payload.event)
+    event_type = (
+        event_obj.get("event_type")
+        if isinstance(event_obj, dict)
+        else str(event_obj or "event")
+    )
     body = {
         "workflow_id": payload.workflow_id,
-        "event": _to_jsonable(payload.event),
+        "event": event_type or "event",
+        "event_details": event_obj,
         "state": _to_jsonable(payload.state),
     }
     url = urljoin(settings.legacy_backend_base_url + "/", settings.legacy_event_callback_path.lstrip("/"))
