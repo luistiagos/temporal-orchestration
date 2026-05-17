@@ -105,25 +105,38 @@ class LeadRemarketingWorkflow:
                 if await self._stop_if_requested():
                     return self._state
 
-                purchase = await workflow.execute_activity(
-                    check_purchase,
-                    PurchaseCheckInput(
-                        tenant_id=payload.tenant_id,
-                        lead_id=payload.lead_id,
-                        email=payload.email,
-                        phone=payload.phone,
-                        userip=payload.userip,
-                        fbp=payload.fbp,
-                        product_id=payload.product_id,
-                        metadata=payload.metadata,
-                    ),
-                    start_to_close_timeout=timedelta(seconds=30),
-                    retry_policy=RetryPolicy(
-                        initial_interval=timedelta(seconds=5),
-                        maximum_interval=timedelta(minutes=1),
-                        maximum_attempts=3,
-                    ),
-                )
+                try:
+                    purchase = await workflow.execute_activity(
+                        check_purchase,
+                        PurchaseCheckInput(
+                            tenant_id=payload.tenant_id,
+                            lead_id=payload.lead_id,
+                            email=payload.email,
+                            phone=payload.phone,
+                            userip=payload.userip,
+                            fbp=payload.fbp,
+                            product_id=payload.product_id,
+                            metadata=payload.metadata,
+                        ),
+                        start_to_close_timeout=timedelta(seconds=30),
+                        retry_policy=RetryPolicy(
+                            initial_interval=timedelta(seconds=10),
+                            backoff_coefficient=2.0,
+                            maximum_interval=timedelta(minutes=5),
+                            maximum_attempts=5,
+                        ),
+                    )
+                except Exception as exc:
+                    # Todas as retentativas esgotadas. NÃO assumimos compra —
+                    # o status fica 'error' para tornar a falha visível e
+                    # diferenciá-la de 'purchased'. O planner pode recriar o
+                    # workflow em uma próxima execução.
+                    self._state.status = "error"
+                    self._state.last_error = f"purchase_check failed: {str(exc)[:300]}"
+                    self._add_event("purchase_check_failed", self._state.last_error)
+                    await self._notify_last_event()
+                    return self._state
+
                 if purchase.purchased:
                     self._state.status = "purchased"
                     self._add_event("workflow_stopped", purchase.reason or "Lead purchased")

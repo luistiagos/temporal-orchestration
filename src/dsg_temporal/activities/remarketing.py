@@ -62,8 +62,7 @@ def check_purchase(payload: PurchaseCheckInput) -> PurchaseCheckResult:
     # IMPORTANTE: só enviamos email e phone (identificadores únicos do lead).
     # userip e fbp são compartilhados (NAT, cookies de browser) e geram falsos
     # positivos — qualquer outro lead na mesma rede ou que usou o mesmo browser
-    # ativaria 'purchased=true' indevidamente, fazendo o workflow encerrar antes
-    # de despachar qualquer step.
+    # ativaria 'purchased=true' indevidamente.
     body = {
         "email": payload.email,
         "phone": payload.phone,
@@ -72,21 +71,30 @@ def check_purchase(payload: PurchaseCheckInput) -> PurchaseCheckResult:
         "lead_id": payload.lead_id,
         "metadata": payload.metadata,
     }
+    # Erros de rede e respostas retryables propagam para Temporal retentar
+    # com backoff. NÃO usamos mais assume_purchased_on_check_error: se a
+    # checagem falhar definitivamente, o workflow marca status='error' em
+    # vez de assumir compra silenciosa.
     try:
         response = _legacy_remarketing_get(settings.legacy_purchase_check_path, body)
-        raw = response_json_or_raw(response)
-        if response.status_code >= 400:
-            reason = f"purchase check http {response.status_code}"
-            if settings.assume_purchased_on_check_error:
-                return PurchaseCheckResult(purchased=True, reason=reason, raw=raw)
-            raise RuntimeError(reason)
-        purchased = bool(raw.get("value", raw.get("purchased", raw.get("haspurchase", raw))))
-        return PurchaseCheckResult(purchased=purchased, raw=raw)
-    except Exception as exc:
-        logger.exception("purchase check failed")
-        if settings.assume_purchased_on_check_error:
-            return PurchaseCheckResult(purchased=True, reason=str(exc)[:500])
+    except (requests.Timeout, requests.ConnectionError, requests.RequestException) as exc:
+        logger.warning("purchase check transient error (will retry): %s", exc)
         raise
+
+    raw = response_json_or_raw(response)
+    if response.status_code in (429, 500, 502, 503, 504):
+        logger.warning("purchase check retryable http %s", response.status_code)
+        raise RuntimeError(f"purchase check retryable http {response.status_code}")
+    if response.status_code >= 400:
+        logger.error(
+            "purchase check non-retryable http %s body=%s",
+            response.status_code,
+            raw,
+        )
+        raise RuntimeError(f"purchase check http {response.status_code}: {raw}")
+
+    purchased = bool(raw.get("value", raw.get("purchased", raw.get("haspurchase", raw))))
+    return PurchaseCheckResult(purchased=purchased, raw=raw)
 
 
 @activity.defn
