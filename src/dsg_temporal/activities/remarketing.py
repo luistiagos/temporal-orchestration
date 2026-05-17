@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import Any
 from urllib.parse import urljoin
@@ -167,6 +168,17 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
     )
 
 
+def _to_jsonable(value: Any) -> Any:
+    """Converte dataclasses (recursivamente) em dict para serialização JSON."""
+    if dataclasses.is_dataclass(value):
+        return dataclasses.asdict(value)
+    if isinstance(value, list):
+        return [_to_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _to_jsonable(v) for k, v in value.items()}
+    return value
+
+
 @activity.defn
 def notify_remarketing_event(payload: NotifyRemarketingEventInput) -> None:
     settings = get_settings()
@@ -175,8 +187,8 @@ def notify_remarketing_event(payload: NotifyRemarketingEventInput) -> None:
 
     body = {
         "workflow_id": payload.workflow_id,
-        "event": payload.event,
-        "state": payload.state,
+        "event": _to_jsonable(payload.event),
+        "state": _to_jsonable(payload.state),
     }
     url = urljoin(settings.legacy_backend_base_url + "/", settings.legacy_event_callback_path.lstrip("/"))
     headers = {
@@ -193,6 +205,10 @@ def notify_remarketing_event(payload: NotifyRemarketingEventInput) -> None:
             timeout=settings.http_timeout_seconds,
         )
         if response.status_code >= 400:
-            logger.warning("event callback failed with http %s", response.status_code)
+            logger.warning(
+                "event callback failed http=%s body=%s",
+                response.status_code,
+                response.text[:300],
+            )
     except Exception:
         logger.exception("event callback failed")
