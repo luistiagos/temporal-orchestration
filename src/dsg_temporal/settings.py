@@ -97,6 +97,8 @@ class Settings:
     assume_purchased_on_check_error: bool
     http_timeout_seconds: int
     activity_max_workers: int
+    whatsapp_min_interval_seconds: int
+    email_min_interval_seconds: int
 
 
 @lru_cache(maxsize=1)
@@ -132,4 +134,9 @@ def get_settings() -> Settings:
         ),
         http_timeout_seconds=_int_env("HTTP_TIMEOUT_SECONDS", 20),
         activity_max_workers=_int_env("ACTIVITY_MAX_WORKERS", 20),
+        # Throttle global: cada dispatch espera no mínimo N segundos desde
+        # o último dispatch do mesmo canal (no mesmo worker). Para WhatsApp
+        # 90s (~40/h) é conservador e evita ban por volume. Email 10s.
+        whatsapp_min_interval_seconds=_int_env("WHATSAPP_MIN_INTERVAL_SECONDS", 90),
+        email_min_interval_seconds=_int_env("EMAIL_MIN_INTERVAL_SECONDS", 10),
     )

@@ -307,7 +307,9 @@ class LeadRemarketingWorkflow:
                     product_id=payload.product_id,
                     metadata=payload.metadata,
                 ),
-                start_to_close_timeout=timedelta(minutes=2),
+                # 10 min cobre throttling (WhatsApp ~90s) + HTTP timeout
+                # mesmo quando há fila grande aguardando o gate.
+                start_to_close_timeout=timedelta(minutes=10),
                 retry_policy=RetryPolicy(maximum_attempts=1),
             )
 

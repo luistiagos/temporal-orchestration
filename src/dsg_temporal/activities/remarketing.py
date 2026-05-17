@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import threading
+import time
 from typing import Any
 from urllib.parse import urljoin
 
@@ -97,6 +99,35 @@ def check_purchase(payload: PurchaseCheckInput) -> PurchaseCheckResult:
     return PurchaseCheckResult(purchased=purchased, raw=raw)
 
 
+# --- Global per-worker rate limit gate for dispatch ---
+# Cada canal compartilha um lock e um "last sent at" entre as activities
+# rodando no mesmo processo de worker. Não é distribuído: vale para a
+# instância. Para múltiplas instâncias somar-se-iam — mantenha uma só.
+_dispatch_locks: dict[str, threading.Lock] = {
+    "email": threading.Lock(),
+    "whatsapp": threading.Lock(),
+}
+_dispatch_last_sent_at: dict[str, float] = {"email": 0.0, "whatsapp": 0.0}
+
+
+def _throttle_channel(channel: str, min_interval: float) -> float:
+    """Bloqueia até passar pelo menos min_interval segundos desde o último
+    envio do canal. Retorna quanto tempo foi esperado (para log)."""
+    if min_interval <= 0 or channel not in _dispatch_locks:
+        return 0.0
+    waited = 0.0
+    lock = _dispatch_locks[channel]
+    with lock:
+        now = time.monotonic()
+        last = _dispatch_last_sent_at[channel]
+        delta = now - last
+        if delta < min_interval:
+            waited = min_interval - delta
+            time.sleep(waited)
+        _dispatch_last_sent_at[channel] = time.monotonic()
+    return waited
+
+
 @activity.defn
 def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
     settings = get_settings()
@@ -108,6 +139,19 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
             status=status,
             provider_message_id=f"dry-run-{payload.idempotency_key}",
             reason="dry_run",
+        )
+
+    if channel == "whatsapp":
+        min_interval = settings.whatsapp_min_interval_seconds
+    elif channel == "email":
+        min_interval = settings.email_min_interval_seconds
+    else:
+        min_interval = 0
+    waited = _throttle_channel(channel, min_interval)
+    if waited > 0:
+        logger.info(
+            "throttled %s dispatch for %.1fs (min_interval=%ds)",
+            channel, waited, min_interval,
         )
 
     body = {
