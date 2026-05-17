@@ -1,11 +1,37 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+
+# Janela de envio permitida para WhatsApp em horário de Brasília (UTC-3).
+# Mensagens com due_at fora desta janela são adiadas para o próximo 09:00 BRT.
+WHATSAPP_TZ_OFFSET_HOURS = -3
+WHATSAPP_WINDOW_START_HOUR = 9
+WHATSAPP_WINDOW_END_HOUR = 20  # 20:00 = limite superior (não envia >= 20:00)
+
+
+def _whatsapp_next_allowed(now_utc: datetime) -> datetime:
+    """Se o horário (em BRT) cai fora de 09:00–20:00, retorna o próximo 09:00 BRT;
+    caso contrário retorna o próprio now_utc (sem adiamento)."""
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    brt = now_utc + timedelta(hours=WHATSAPP_TZ_OFFSET_HOURS)
+    hour = brt.hour
+    if WHATSAPP_WINDOW_START_HOUR <= hour < WHATSAPP_WINDOW_END_HOUR:
+        return now_utc
+    target_brt = brt.replace(
+        hour=WHATSAPP_WINDOW_START_HOUR, minute=0, second=0, microsecond=0
+    )
+    if hour >= WHATSAPP_WINDOW_END_HOUR:
+        target_brt = target_brt + timedelta(days=1)
+    # Volta para UTC
+    return (target_brt - timedelta(hours=WHATSAPP_TZ_OFFSET_HOURS)).replace(
+        tzinfo=timezone.utc
+    )
 
 from dsg_temporal.ids import remarketing_idempotency_key
 from dsg_temporal.schedule import compute_due_at, parse_iso_datetime
@@ -142,6 +168,24 @@ class LeadRemarketingWorkflow:
                     self._add_event("workflow_stopped", purchase.reason or "Lead purchased")
                     await self._notify_last_event()
                     return self._state
+
+                # Quiet hours para WhatsApp: 20:00 BRT a 09:00 BRT do dia seguinte.
+                # Se o dispatch caísse fora dessa janela, adiamos.
+                if (step.channel or "").strip().lower() == "whatsapp":
+                    now_utc = workflow.now()
+                    allowed_at = _whatsapp_next_allowed(now_utc)
+                    if allowed_at > now_utc:
+                        wait_seconds = (allowed_at - now_utc).total_seconds()
+                        self._state.status = "waiting_window"
+                        self._add_event(
+                            "whatsapp_quiet_hours",
+                            f"Postponed {int(wait_seconds // 60)} min until 09:00 BRT",
+                            {"allowed_at_iso": allowed_at.isoformat()},
+                        )
+                        await self._notify_last_event()
+                        await self._wait_until_ready(allowed_at)
+                        if await self._stop_if_requested():
+                            return self._state
 
                 dispatch_result = await self._dispatch_with_manual_unknown_gate(step, cycle)
                 if dispatch_result.status in {"sent", "queued", "skipped"}:
