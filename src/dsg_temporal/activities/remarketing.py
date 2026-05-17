@@ -58,11 +58,14 @@ def check_purchase(payload: PurchaseCheckInput) -> PurchaseCheckResult:
     if settings.dry_run:
         return PurchaseCheckResult(purchased=False, reason="dry_run")
 
+    # IMPORTANTE: só enviamos email e phone (identificadores únicos do lead).
+    # userip e fbp são compartilhados (NAT, cookies de browser) e geram falsos
+    # positivos — qualquer outro lead na mesma rede ou que usou o mesmo browser
+    # ativaria 'purchased=true' indevidamente, fazendo o workflow encerrar antes
+    # de despachar qualquer step.
     body = {
-        "userip": payload.userip,
         "email": payload.email,
         "phone": payload.phone,
-        "fbp": payload.fbp,
         "productid": payload.product_id,
         "tenant_id": payload.tenant_id,
         "lead_id": payload.lead_id,
