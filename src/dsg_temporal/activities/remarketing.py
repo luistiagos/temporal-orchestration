@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import random
 import threading
 import time
 from typing import Any
@@ -21,6 +22,12 @@ from dsg_temporal.schemas import (
 from dsg_temporal.settings import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+# Sentinela retornada pela activity quando o cap diário foi atingido. O
+# workflow trata e dorme até a próxima janela em vez de manter a activity
+# aberta por horas.
+WHATSAPP_CAP_REACHED = "cap_reached"
 
 
 def _legacy_remarketing_headers(idempotency_key: str | None = None) -> dict[str, str]:
@@ -128,6 +135,64 @@ def _throttle_channel(channel: str, min_interval: float) -> float:
     return waited
 
 
+def _fetch_wpp_sender_snapshot() -> dict | None:
+    """Busca a configuração + estatísticas atuais de envio WhatsApp no backend.
+    Retorna None em caso de erro (worker faz fallback seguro: skip)."""
+    settings = get_settings()
+    if not settings.legacy_wpp_sender_snapshot_path:
+        return None
+    url = urljoin(
+        settings.legacy_backend_base_url + "/",
+        settings.legacy_wpp_sender_snapshot_path.lstrip("/"),
+    )
+    headers = {"User-Agent": "dsg-temporal-remarketing/0.1"}
+    if settings.legacy_event_callback_secret:
+        headers["X-Callback-Secret"] = settings.legacy_event_callback_secret
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=settings.http_timeout_seconds,
+        )
+        if response.status_code >= 400:
+            logger.warning(
+                "wpp sender snapshot http=%s body=%s",
+                response.status_code,
+                response.text[:200],
+            )
+            return None
+        return response.json()
+    except Exception as exc:
+        logger.warning("wpp sender snapshot failed: %s", exc)
+        return None
+
+
+def _apply_whatsapp_pacing(snapshot: dict) -> None:
+    """Aplica o pacing aleatório (min..max) entre dois envios WhatsApp no
+    mesmo worker, usando o lock global do canal."""
+    min_iv = max(1, int(snapshot.get("min_interval_seconds", 90)))
+    max_iv = max(min_iv, int(snapshot.get("max_interval_seconds", 300)))
+    target = random.uniform(min_iv, max_iv)
+    lock = _dispatch_locks["whatsapp"]
+    with lock:
+        now = time.monotonic()
+        last = _dispatch_last_sent_at["whatsapp"]
+        elapsed = now - last
+        if last > 0 and elapsed < target:
+            wait = target - elapsed
+            logger.info(
+                "whatsapp pacing: waiting %.1fs (target=%.1fs, elapsed=%.1fs, range=%d..%d)",
+                wait, target, elapsed, min_iv, max_iv,
+            )
+            # Heartbeat antes de dormir longos períodos
+            try:
+                activity.heartbeat({"pacing_wait_seconds": wait})
+            except Exception:
+                pass
+            time.sleep(wait)
+        _dispatch_last_sent_at["whatsapp"] = time.monotonic()
+
+
 @activity.defn
 def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
     settings = get_settings()
@@ -141,39 +206,69 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
             reason="dry_run",
         )
 
-    # WhatsApp desabilitado até liberar novo chip — recusa o dispatch
-    # como skipped (não falha o workflow, só pula o step).
-    if channel == "whatsapp" and not settings.remarketing_whatsapp_enabled:
-        logger.info("whatsapp dispatch skipped (REMARKETING_WHATSAPP_ENABLED=false)")
-        return DispatchResult(
-            status="skipped",
-            retryable=False,
-            reason="whatsapp disabled by config",
-        )
+    dispatch_email = payload.email
+    dispatch_phone = payload.phone
 
     if channel == "whatsapp":
-        min_interval = settings.whatsapp_min_interval_seconds
-    elif channel == "email":
-        min_interval = settings.email_min_interval_seconds
-    else:
-        min_interval = 0
-    waited = _throttle_channel(channel, min_interval)
-    if waited > 0:
-        logger.info(
-            "throttled %s dispatch for %.1fs (min_interval=%ds)",
-            channel, waited, min_interval,
-        )
+        # Toda a configuração de WhatsApp vem do backend (WhatsAppSenderConfig).
+        snapshot = _fetch_wpp_sender_snapshot()
+        if snapshot is None:
+            # Sem snapshot disponível, falha para retry no workflow.
+            return DispatchResult(
+                status="failed",
+                retryable=True,
+                reason="wpp_sender snapshot unavailable",
+            )
 
-    # Modo de teste: redireciona TODOS os envios de email para um único
-    # endereço (configurado por REMARKETING_EMAIL_OVERRIDE_TO). Permite
-    # validar o pipeline em produção sem enviar para clientes reais.
-    dispatch_email = payload.email
-    if channel == "email" and settings.remarketing_email_override_to:
-        dispatch_email = settings.remarketing_email_override_to
-        logger.info(
-            "email override active: %s -> %s (test mode)",
-            payload.email, dispatch_email,
-        )
+        if not snapshot.get("enabled"):
+            logger.info("whatsapp dispatch skipped (sender disabled in admin)")
+            return DispatchResult(
+                status="skipped",
+                retryable=False,
+                reason="whatsapp sender disabled in admin",
+            )
+
+        # Cap diário: o workflow trata (dorme até a próxima janela).
+        sent_today = int(snapshot.get("sent_today", 0))
+        max_per_day = int(snapshot.get("max_per_day", 0))
+        if max_per_day > 0 and sent_today >= max_per_day:
+            wait_seconds = int(snapshot.get("next_window_starts_in_seconds", 0))
+            logger.info(
+                "whatsapp daily cap reached (%d/%d) — workflow will sleep %ds",
+                sent_today, max_per_day, wait_seconds,
+            )
+            return DispatchResult(
+                status=WHATSAPP_CAP_REACHED,
+                retryable=False,
+                reason=f"daily cap reached {sent_today}/{max_per_day}",
+                raw={"next_window_seconds": wait_seconds},
+            )
+
+        # Modo teste: 100% dos envios vão para test_phone quando ativo.
+        if snapshot.get("test_mode_enabled") and snapshot.get("test_phone"):
+            override = str(snapshot["test_phone"]).strip()
+            logger.info(
+                "whatsapp test mode active: %s -> %s",
+                payload.phone, override,
+            )
+            dispatch_phone = override
+
+        # Aplica o pacing aleatório min..max (lock global do worker).
+        _apply_whatsapp_pacing(snapshot)
+    elif channel == "email":
+        waited = _throttle_channel("email", settings.email_min_interval_seconds)
+        if waited > 0:
+            logger.info(
+                "throttled email dispatch for %.1fs (min_interval=%ds)",
+                waited, settings.email_min_interval_seconds,
+            )
+        # Modo de teste de email (separado do de WhatsApp).
+        if settings.remarketing_email_override_to:
+            dispatch_email = settings.remarketing_email_override_to
+            logger.info(
+                "email override active: %s -> %s (test mode)",
+                payload.email, dispatch_email,
+            )
 
     body = {
         "tenant_id": payload.tenant_id,
@@ -184,7 +279,7 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
         "remarketstoreid": payload.step.metadata.get("remarket_store_id"),
         "idempotency_key": payload.idempotency_key,
         "email": dispatch_email,
-        "phone": payload.phone,
+        "phone": dispatch_phone,
         "title": payload.step.subject,
         "subject": payload.step.subject,
         "template": payload.step.template,
@@ -221,23 +316,45 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
         return DispatchResult(status="failed", retryable=True, reason=str(exc)[:500])
 
     raw = response_json_or_raw(response)
+
+    # Para WhatsApp, o backend retorna 200 mesmo em falhas funcionais (ok=false).
+    # Precisamos diferenciar "enviado" de "número inválido" para evitar 3
+    # retentativas inúteis quando o número simplesmente não existe.
+    if channel == "whatsapp" and response.status_code == 200:
+        ok_flag = raw.get("ok") if isinstance(raw, dict) else None
+        if ok_flag is False:
+            retryable = bool(raw.get("retryable", False))
+            reason = str(raw.get("reason") or raw.get("error") or "whatsapp send failed")
+            logger.info(
+                "whatsapp dispatch returned ok=false retryable=%s reason=%s",
+                retryable, reason,
+            )
+            return DispatchResult(
+                status="failed",
+                retryable=retryable,
+                reason=reason[:500],
+                raw=raw if isinstance(raw, dict) else {},
+            )
+
     if response.status_code in (200, 201, 202):
-        provider_id = (
-            raw.get("message_id")
-            or raw.get("msg_id")
-            or raw.get("id")
-            or raw.get("queue_id")
-            or raw.get("outbox_id")
-        )
-        status = "queued" if channel == "whatsapp" else "sent"
-        return DispatchResult(status=status, provider_message_id=provider_id, raw=raw)
+        provider_id = None
+        if isinstance(raw, dict):
+            provider_id = (
+                raw.get("message_id")
+                or raw.get("msg_id")
+                or raw.get("id")
+                or raw.get("queue_id")
+                or raw.get("outbox_id")
+            )
+        status = "sent"  # WhatsApp já é "sent" — o envio é síncrono ao Evolution API
+        return DispatchResult(status=status, provider_message_id=provider_id, raw=raw if isinstance(raw, dict) else {})
 
     retryable = response.status_code >= 500 or response.status_code == 429
     return DispatchResult(
         status="failed",
         retryable=retryable,
         reason=f"http {response.status_code}",
-        raw=raw,
+        raw=raw if isinstance(raw, dict) else {},
     )
 
 

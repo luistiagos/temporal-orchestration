@@ -222,6 +222,12 @@ class LeadRemarketingWorkflow:
                 self._state.last_error = dispatch_result.reason
                 self._add_event("step_failed", dispatch_result.reason)
                 await self._notify_last_event()
+                # WhatsApp: após 3 retentativas esgotadas, sempre pula o
+                # step e continua o workflow (não interrompe). Outros canais
+                # mantêm o comportamento de `stop_on_step_failure`.
+                channel_l = (step.channel or "").strip().lower()
+                if channel_l == "whatsapp":
+                    continue
                 if payload.stop_on_step_failure:
                     self._state.status = "failed"
                     return self._state
@@ -282,6 +288,7 @@ class LeadRemarketingWorkflow:
     async def _dispatch_with_manual_unknown_gate(self, step, cycle: int) -> DispatchResult:
         assert self._input is not None
         payload = self._input
+        channel = (step.channel or "").strip().lower()
         idem_key = remarketing_idempotency_key(
             payload.tenant_id,
             payload.lead_id,
@@ -289,10 +296,22 @@ class LeadRemarketingWorkflow:
             step.step_id,
             cycle,
         )
+        # Política de retry específica do canal:
+        #   WhatsApp: 3 tentativas com pausas curtas (5s, 10s, 15s) entre elas.
+        #   Demais:   3 tentativas com 5min entre elas (comportamento anterior).
+        if channel == "whatsapp":
+            retry_waits_seconds = [5, 10, 15]
+        else:
+            retry_waits_seconds = [300, 300, 300]
+        max_attempts = len(retry_waits_seconds)
+
         attempts = 0
         while True:
             attempts += 1
             self._state.status = "dispatching"
+            # WhatsApp pode esperar até max_interval (default 300s) + HTTP +
+            # heartbeat — 30 min é folga confortável.
+            timeout = timedelta(minutes=30) if channel == "whatsapp" else timedelta(minutes=10)
             result = await workflow.execute_activity(
                 dispatch_remarketing_step,
                 DispatchStepInput(
@@ -307,15 +326,39 @@ class LeadRemarketingWorkflow:
                     product_id=payload.product_id,
                     metadata=payload.metadata,
                 ),
-                # 10 min cobre throttling (WhatsApp ~90s) + HTTP timeout
-                # mesmo quando há fila grande aguardando o gate.
-                start_to_close_timeout=timedelta(minutes=10),
+                start_to_close_timeout=timeout,
+                heartbeat_timeout=timedelta(minutes=2) if channel == "whatsapp" else None,
                 retry_policy=RetryPolicy(maximum_attempts=1),
             )
 
+            # WhatsApp: cap diário atingido → o workflow dorme até a próxima
+            # janela (próx. 00:00 BRT) e tenta de novo o mesmo step.
+            if channel == "whatsapp" and result.status == "cap_reached":
+                wait_seconds = int((result.raw or {}).get("next_window_seconds", 0)) or 3600
+                self._state.status = "waiting_window"
+                self._add_event(
+                    "whatsapp_cap_reached",
+                    f"Daily cap reached — sleeping {wait_seconds // 60} min until next window",
+                    {"step_id": step.step_id, "cycle": cycle, "wait_seconds": wait_seconds},
+                )
+                await self._notify_last_event()
+                await workflow.sleep(timedelta(seconds=wait_seconds))
+                if self._cancel_requested or self._purchase_confirmed:
+                    return DispatchResult(status="skipped", reason="workflow stopped")
+                # Reset attempts: a espera não conta como tentativa real.
+                attempts = 0
+                continue
+
             if result.status != "unknown":
-                if result.status == "failed" and result.retryable and attempts < 3:
-                    await workflow.sleep(timedelta(minutes=5))
+                if result.status == "failed" and result.retryable and attempts < max_attempts:
+                    wait_s = retry_waits_seconds[attempts - 1]
+                    self._add_event(
+                        "step_retry",
+                        f"{channel} retry {attempts}/{max_attempts} in {wait_s}s — {result.reason}",
+                        {"step_id": step.step_id, "cycle": cycle, "attempt": attempts},
+                    )
+                    await self._notify_last_event()
+                    await workflow.sleep(timedelta(seconds=wait_s))
                     continue
                 return result
 

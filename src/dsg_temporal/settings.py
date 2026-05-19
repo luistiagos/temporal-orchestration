@@ -93,13 +93,12 @@ class Settings:
     legacy_event_callback_path: str
     legacy_event_callback_secret: str
     legacy_whatsapp_process_path: str
+    legacy_wpp_sender_snapshot_path: str
     dry_run: bool
     assume_purchased_on_check_error: bool
     http_timeout_seconds: int
     activity_max_workers: int
-    whatsapp_min_interval_seconds: int
     email_min_interval_seconds: int
-    remarketing_whatsapp_enabled: bool
     remarketing_email_override_to: str
 
 
@@ -129,6 +128,13 @@ def get_settings() -> Settings:
             "LEGACY_WHATSAPP_PROCESS_PATH",
             "/temporal/whatsapp/process",
         ),
+        # Endpoint do backend que o worker consulta a cada dispatch de WhatsApp
+        # para obter min/max intervalo, cap diário, modo teste e estatísticas.
+        # Autenticado pelo mesmo segredo do callback (LEGACY_EVENT_CALLBACK_SECRET).
+        legacy_wpp_sender_snapshot_path=_str_env(
+            "LEGACY_WPP_SENDER_SNAPSHOT_PATH",
+            "/admin/wpp-sender/snapshot",
+        ),
         dry_run=_bool_env("DRY_RUN", True),
         assume_purchased_on_check_error=_bool_env(
             "ASSUME_PURCHASED_ON_CHECK_ERROR",
@@ -136,18 +142,11 @@ def get_settings() -> Settings:
         ),
         http_timeout_seconds=_int_env("HTTP_TIMEOUT_SECONDS", 20),
         activity_max_workers=_int_env("ACTIVITY_MAX_WORKERS", 20),
-        # Throttle global: cada dispatch espera no mínimo N segundos desde
-        # o último dispatch do mesmo canal (no mesmo worker). Para WhatsApp
-        # 90s (~40/h) é conservador e evita ban por volume. Email 10s.
-        whatsapp_min_interval_seconds=_int_env("WHATSAPP_MIN_INTERVAL_SECONDS", 90),
+        # Throttle global apenas para EMAIL — WhatsApp tem pacing por config
+        # vinda do backend (WhatsAppSenderConfig.min/max_interval_seconds).
         email_min_interval_seconds=_int_env("EMAIL_MIN_INTERVAL_SECONDS", 10),
-        # Defesa em profundidade: ainda que um workflow chegue com step de
-        # WhatsApp (planner antigo, replanejamento), só dispara se essa
-        # flag estiver explicitamente true. Default false após o ban de
-        # 2026-05-17.
-        remarketing_whatsapp_enabled=_bool_env("REMARKETING_WHATSAPP_ENABLED", False),
-        # Modo de teste: se preenchido, todo dispatch de email é redirecionado
-        # para este endereço (ignora o email do lead). Útil para validar o
-        # fluxo sem enviar para clientes reais. Vazio = comportamento normal.
+        # Modo de teste de email: se preenchido, todo dispatch de email é
+        # redirecionado para este endereço. WhatsApp tem seu próprio modo teste
+        # configurado pelo admin (WhatsAppSenderConfig.test_phone).
         remarketing_email_override_to=_str_env("REMARKETING_EMAIL_OVERRIDE_TO", ""),
     )
