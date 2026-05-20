@@ -167,6 +167,25 @@ def _fetch_wpp_sender_snapshot() -> dict | None:
         return None
 
 
+def _heartbeat_safely(payload: Any = None) -> None:
+    """Emite heartbeat — silencioso se a activity não tiver contexto (testes)."""
+    try:
+        activity.heartbeat(payload)
+    except Exception:
+        pass
+
+
+def _sleep_with_heartbeat(total_seconds: float, chunk_seconds: float = 30.0) -> None:
+    """Dorme em chunks emitindo heartbeats. Necessário para sleeps longos
+    em activities com heartbeat_timeout configurado."""
+    remaining = float(total_seconds)
+    while remaining > 0:
+        step = min(chunk_seconds, remaining)
+        time.sleep(step)
+        remaining -= step
+        _heartbeat_safely({"sleep_remaining_seconds": remaining})
+
+
 def _apply_whatsapp_pacing(snapshot: dict) -> None:
     """Aplica o pacing aleatório (min..max) entre dois envios WhatsApp no
     mesmo worker, usando o lock global do canal."""
@@ -184,12 +203,8 @@ def _apply_whatsapp_pacing(snapshot: dict) -> None:
                 "whatsapp pacing: waiting %.1fs (target=%.1fs, elapsed=%.1fs, range=%d..%d)",
                 wait, target, elapsed, min_iv, max_iv,
             )
-            # Heartbeat antes de dormir longos períodos
-            try:
-                activity.heartbeat({"pacing_wait_seconds": wait})
-            except Exception:
-                pass
-            time.sleep(wait)
+            _heartbeat_safely({"pacing_wait_seconds": wait})
+            _sleep_with_heartbeat(wait)
         _dispatch_last_sent_at["whatsapp"] = time.monotonic()
 
 
