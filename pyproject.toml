@@ -28,8 +28,9 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
+  "unit: pure-function unit tests (no infra)",
   "integration: tests that start a local Temporal test server",
-  "live: tests that call a running local API/worker",
+  "live: tests that call real external services (backend/email/whatsapp)",
 ]
 
 [tool.ruff]
