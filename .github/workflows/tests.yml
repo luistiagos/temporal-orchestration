@@ -1,0 +1,19 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install -e ".[dev]" responses
+      - name: Unit + workflow + activity tests (sem live)
+        run: python -m pytest -m "not live" -v
