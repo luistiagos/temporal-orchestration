@@ -33,6 +33,22 @@ def _whatsapp_next_allowed(now_utc: datetime) -> datetime:
         tzinfo=timezone.utc
     )
 
+
+def _whatsapp_resume_after_cap(now_utc: datetime, cap_reset_seconds: float) -> datetime:
+    """Instante (UTC) em que o envio pode retomar após o cap diário ser atingido.
+
+    O cap reseta à meia-noite BRT (`cap_reset_seconds` à frente), mas 00:00 BRT
+    está FORA da janela de envio (09:00–20:00). A retomada precisa satisfazer as
+    DUAS janelas: cap já resetado E dentro do horário comercial. Compondo:
+    avança até o reset do cap e então aplica a guarda de quiet hours — o que
+    empurra a meia-noite para o próximo 09:00 BRT.
+    """
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    cap_reset_at = now_utc + timedelta(seconds=max(0.0, cap_reset_seconds))
+    return _whatsapp_next_allowed(cap_reset_at)
+
+
 from dsg_temporal.ids import remarketing_idempotency_key
 from dsg_temporal.schedule import compute_due_at, parse_iso_datetime
 from dsg_temporal.schemas import (
@@ -332,14 +348,25 @@ class LeadRemarketingWorkflow:
             )
 
             # WhatsApp: cap diário atingido → o workflow dorme até a próxima
-            # janela (próx. 00:00 BRT) e tenta de novo o mesmo step.
+            # janela de ENVIO e tenta de novo o mesmo step. O cap reseta à
+            # meia-noite BRT, mas 00:00 está fora da janela 09:00–20:00 — por
+            # isso compomos as duas janelas (`_whatsapp_resume_after_cap`):
+            # dormir só até 00:00 BRT fazia o re-despacho cair de madrugada,
+            # fora do horário comercial.
             if channel == "whatsapp" and result.status == "cap_reached":
-                wait_seconds = int((result.raw or {}).get("next_window_seconds", 0)) or 3600
+                cap_reset_seconds = int((result.raw or {}).get("next_window_seconds", 0)) or 3600
+                resume_at = _whatsapp_resume_after_cap(workflow.now(), cap_reset_seconds)
+                wait_seconds = max(0, int((resume_at - workflow.now()).total_seconds()))
                 self._state.status = "waiting_window"
                 self._add_event(
                     "whatsapp_cap_reached",
-                    f"Daily cap reached — sleeping {wait_seconds // 60} min until next window",
-                    {"step_id": step.step_id, "cycle": cycle, "wait_seconds": wait_seconds},
+                    f"Daily cap reached — sleeping {wait_seconds // 60} min until 09:00 BRT window",
+                    {
+                        "step_id": step.step_id,
+                        "cycle": cycle,
+                        "wait_seconds": wait_seconds,
+                        "resume_at_iso": resume_at.isoformat(),
+                    },
                 )
                 await self._notify_last_event()
                 await workflow.sleep(timedelta(seconds=wait_seconds))
