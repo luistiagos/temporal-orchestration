@@ -5,6 +5,7 @@ Cobre os casos WPP-09 do plano de testes. Função pura, sem infra.
 from datetime import datetime, timedelta, timezone
 
 from dsg_temporal.workflows.remarketing import (
+    _normalize_window,
     _whatsapp_next_allowed,
     _whatsapp_resume_after_cap,
 )
@@ -102,3 +103,47 @@ def test_resume_nunca_antes_do_reset_do_cap():
         resume = _whatsapp_resume_after_cap(now, 3600)
         assert resume >= cap_reset_at
         assert 9 <= (resume + timedelta(hours=-3)).hour < 20
+
+
+# ---------------------------------------------------------------------------
+# Janela configurável por campanha (parametrizada).
+# Feature docs/funcionalidades/2026-06-24-janela-envio-por-campanha.md
+# ---------------------------------------------------------------------------
+
+def test_normalize_window_default_quando_invalido():
+    assert _normalize_window(None, None) == (9, 20)        # ausente
+    assert _normalize_window("x", 20) == (9, 20)           # não inteiro
+    assert _normalize_window(20, 8) == (9, 20)             # start >= end
+    assert _normalize_window(9, 9) == (9, 20)              # vazia
+    assert _normalize_window(8, 22) == (8, 22)             # válida mantém
+    assert _normalize_window(-5, 30) == (0, 24)            # clamp aos limites
+
+
+def test_janela_custom_posterga_para_o_inicio_configurado():
+    # Janela 08:00–22:00. 23:00 BRT (02:00 UTC) está fora → próximo 08:00 BRT.
+    now = datetime(2026, 5, 20, 2, 0, tzinfo=UTC)          # 23:00 BRT dia 19
+    allowed = _whatsapp_next_allowed(now, 8, 22)
+    assert allowed == datetime(2026, 5, 20, 11, 0, tzinfo=UTC)  # 08:00 BRT dia 20
+
+
+def test_janela_custom_dentro_nao_posterga():
+    # 10:00 BRT (13:00 UTC) dentro de 08–22 → sem adiamento.
+    now = datetime(2026, 5, 20, 13, 0, tzinfo=UTC)
+    assert _whatsapp_next_allowed(now, 8, 22) == now
+
+
+def test_janela_ate_meia_noite_end_24():
+    # Janela 09:00–24:00: 22:00 BRT (01:00 UTC dia seguinte) está dentro.
+    now = datetime(2026, 5, 21, 1, 0, tzinfo=UTC)          # 22:00 BRT dia 20
+    assert _whatsapp_next_allowed(now, 9, 24) == now
+    # 03:00 BRT (06:00 UTC) está fora → próximo 09:00 BRT do mesmo dia.
+    madrugada = datetime(2026, 5, 20, 6, 0, tzinfo=UTC)
+    assert _whatsapp_next_allowed(madrugada, 9, 24) == datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
+
+
+def test_cap_resume_respeita_janela_custom():
+    # Cap batido às 15:00 BRT (18:00 UTC), reset à meia-noite (9h à frente),
+    # janela 10:00–18:00 → retoma às 10:00 BRT do dia seguinte (não 00:00).
+    now = datetime(2026, 5, 20, 18, 0, tzinfo=UTC)         # 15:00 BRT
+    resume = _whatsapp_resume_after_cap(now, 9 * 3600, 10, 18)
+    assert resume == datetime(2026, 5, 21, 13, 0, tzinfo=UTC)  # 10:00 BRT dia 21

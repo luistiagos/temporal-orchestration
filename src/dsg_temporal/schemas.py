@@ -36,6 +36,10 @@ class LeadRemarketingInput:
     lead_created_at_iso: str | None = None
     max_cycles: int = 1
     stop_on_step_failure: bool = True
+    # Janela de envio (hora BRT) por campanha. None => default 09:00–20:00.
+    # Vale para todos os canais — o workflow adia o despacho para dentro dela.
+    window_start_hour: int | None = None
+    window_end_hour: int | None = None
     sequence: list[RemarketingStep] = field(default_factory=list)
     metadata: Metadata = field(default_factory=dict)
 

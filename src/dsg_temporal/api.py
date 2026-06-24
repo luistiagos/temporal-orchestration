@@ -50,6 +50,8 @@ class StartRemarketingRequest(BaseModel):
     lead_created_at_iso: str | None = None
     max_cycles: int = 1
     stop_on_step_failure: bool = True
+    window_start_hour: int | None = None
+    window_end_hour: int | None = None
     sequence: list[RemarketingStepRequest]
     metadata: dict[str, Any] = Field(default_factory=dict)
 

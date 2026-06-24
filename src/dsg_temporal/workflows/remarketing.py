@@ -7,26 +7,53 @@ from typing import Any
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 
-# Janela de envio permitida para WhatsApp em horário de Brasília (UTC-3).
-# Mensagens com due_at fora desta janela são adiadas para o próximo 09:00 BRT.
+# Janela de envio permitida em horário de Brasília (UTC-3). Vale para TODOS os
+# canais de remarketing (e-mail + WhatsApp). A janela é configurável por
+# campanha (loja) — os valores chegam no payload do workflow; estes são apenas
+# o DEFAULT quando a campanha não tem janela própria. Envios fora da janela são
+# adiados para o próximo horário de início (ex.: 09:00 BRT).
 WHATSAPP_TZ_OFFSET_HOURS = -3
 WHATSAPP_WINDOW_START_HOUR = 9
 WHATSAPP_WINDOW_END_HOUR = 20  # 20:00 = limite superior (não envia >= 20:00)
 
 
-def _whatsapp_next_allowed(now_utc: datetime) -> datetime:
-    """Se o horário (em BRT) cai fora de 09:00–20:00, retorna o próximo 09:00 BRT;
-    caso contrário retorna o próprio now_utc (sem adiamento)."""
+def _normalize_window(start_hour: int | None, end_hour: int | None) -> tuple[int, int]:
+    """Normaliza (start, end) em horas inteiras BRT. start 0–23, end 1–24, e
+    exige start < end. Qualquer inconsistência cai no default 09:00–20:00."""
+    try:
+        s = int(start_hour)
+        e = int(end_hour)
+    except (TypeError, ValueError):
+        return WHATSAPP_WINDOW_START_HOUR, WHATSAPP_WINDOW_END_HOUR
+    s = max(0, min(s, 23))
+    e = max(1, min(e, 24))
+    if s >= e:
+        return WHATSAPP_WINDOW_START_HOUR, WHATSAPP_WINDOW_END_HOUR
+    return s, e
+
+
+def _whatsapp_next_allowed(
+    now_utc: datetime,
+    start_hour: int | None = None,
+    end_hour: int | None = None,
+) -> datetime:
+    """Se o horário (em BRT) cai fora da janela [start, end), retorna o próximo
+    `start` BRT; caso contrário retorna o próprio now_utc (sem adiamento).
+    Sem start/end usa o default 09:00–20:00."""
+    start_hour, end_hour = _normalize_window(
+        WHATSAPP_WINDOW_START_HOUR if start_hour is None else start_hour,
+        WHATSAPP_WINDOW_END_HOUR if end_hour is None else end_hour,
+    )
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)
     brt = now_utc + timedelta(hours=WHATSAPP_TZ_OFFSET_HOURS)
     hour = brt.hour
-    if WHATSAPP_WINDOW_START_HOUR <= hour < WHATSAPP_WINDOW_END_HOUR:
+    if start_hour <= hour < end_hour:
         return now_utc
-    target_brt = brt.replace(
-        hour=WHATSAPP_WINDOW_START_HOUR, minute=0, second=0, microsecond=0
+    target_brt = brt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(
+        hours=start_hour
     )
-    if hour >= WHATSAPP_WINDOW_END_HOUR:
+    if hour >= end_hour:
         target_brt = target_brt + timedelta(days=1)
     # Volta para UTC
     return (target_brt - timedelta(hours=WHATSAPP_TZ_OFFSET_HOURS)).replace(
@@ -34,19 +61,24 @@ def _whatsapp_next_allowed(now_utc: datetime) -> datetime:
     )
 
 
-def _whatsapp_resume_after_cap(now_utc: datetime, cap_reset_seconds: float) -> datetime:
+def _whatsapp_resume_after_cap(
+    now_utc: datetime,
+    cap_reset_seconds: float,
+    start_hour: int | None = None,
+    end_hour: int | None = None,
+) -> datetime:
     """Instante (UTC) em que o envio pode retomar após o cap diário ser atingido.
 
     O cap reseta à meia-noite BRT (`cap_reset_seconds` à frente), mas 00:00 BRT
-    está FORA da janela de envio (09:00–20:00). A retomada precisa satisfazer as
-    DUAS janelas: cap já resetado E dentro do horário comercial. Compondo:
-    avança até o reset do cap e então aplica a guarda de quiet hours — o que
-    empurra a meia-noite para o próximo 09:00 BRT.
+    está FORA da janela de envio. A retomada precisa satisfazer as DUAS janelas:
+    cap já resetado E dentro do horário comercial. Compondo: avança até o reset
+    do cap e então aplica a guarda de janela — o que empurra a meia-noite para
+    o próximo horário de início (ex.: 09:00 BRT).
     """
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)
     cap_reset_at = now_utc + timedelta(seconds=max(0.0, cap_reset_seconds))
-    return _whatsapp_next_allowed(cap_reset_at)
+    return _whatsapp_next_allowed(cap_reset_at, start_hour, end_hour)
 
 
 from dsg_temporal.ids import remarketing_idempotency_key
@@ -185,23 +217,28 @@ class LeadRemarketingWorkflow:
                     await self._notify_last_event()
                     return self._state
 
-                # Quiet hours para WhatsApp: 20:00 BRT a 09:00 BRT do dia seguinte.
-                # Se o dispatch caísse fora dessa janela, adiamos.
-                if (step.channel or "").strip().lower() == "whatsapp":
-                    now_utc = workflow.now()
-                    allowed_at = _whatsapp_next_allowed(now_utc)
-                    if allowed_at > now_utc:
-                        wait_seconds = (allowed_at - now_utc).total_seconds()
-                        self._state.status = "waiting_window"
-                        self._add_event(
-                            "whatsapp_quiet_hours",
-                            f"Postponed {int(wait_seconds // 60)} min until 09:00 BRT",
-                            {"allowed_at_iso": allowed_at.isoformat()},
-                        )
-                        await self._notify_last_event()
-                        await self._wait_until_ready(allowed_at)
-                        if await self._stop_if_requested():
-                            return self._state
+                # Janela de envio (TODOS os canais): se o horário atual cai fora
+                # da janela da campanha (default 09:00–20:00 BRT), adia o
+                # despacho para o próximo início de janela.
+                now_utc = workflow.now()
+                allowed_at = _whatsapp_next_allowed(
+                    now_utc, payload.window_start_hour, payload.window_end_hour
+                )
+                if allowed_at > now_utc:
+                    wait_seconds = (allowed_at - now_utc).total_seconds()
+                    self._state.status = "waiting_window"
+                    self._add_event(
+                        "send_window_wait",
+                        f"Postponed {int(wait_seconds // 60)} min until send window",
+                        {
+                            "allowed_at_iso": allowed_at.isoformat(),
+                            "channel": (step.channel or "").strip().lower(),
+                        },
+                    )
+                    await self._notify_last_event()
+                    await self._wait_until_ready(allowed_at)
+                    if await self._stop_if_requested():
+                        return self._state
 
                 dispatch_result = await self._dispatch_with_manual_unknown_gate(step, cycle)
                 if dispatch_result.status in {"sent", "queued", "skipped"}:
@@ -355,7 +392,12 @@ class LeadRemarketingWorkflow:
             # fora do horário comercial.
             if channel == "whatsapp" and result.status == "cap_reached":
                 cap_reset_seconds = int((result.raw or {}).get("next_window_seconds", 0)) or 3600
-                resume_at = _whatsapp_resume_after_cap(workflow.now(), cap_reset_seconds)
+                resume_at = _whatsapp_resume_after_cap(
+                    workflow.now(),
+                    cap_reset_seconds,
+                    payload.window_start_hour,
+                    payload.window_end_hour,
+                )
                 wait_seconds = max(0, int((resume_at - workflow.now()).total_seconds()))
                 self._state.status = "waiting_window"
                 self._add_event(
