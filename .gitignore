@@ -11,4 +11,5 @@ build/
 worker.log
 api.log
 dev_local.*.log
+*.log
 .temporal/
