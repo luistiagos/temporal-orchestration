@@ -118,6 +118,31 @@ async def health() -> dict[str, str]:
     }
 
 
+@app.get("/debug/workers")
+async def debug_workers(request: Request) -> dict[str, Any]:
+    client = temporal_client(request)
+    settings = get_settings()
+    try:
+        desc = await client.describe_task_queue(
+            settings.temporal_task_queue,
+        )
+        pollers = []
+        for poller in desc.pollers:
+            pollers.append({
+                "identity": poller.identity,
+                "last_access_time": poller.last_access_time.isoformat() if poller.last_access_time else None,
+                "rate_per_second": poller.rate_per_second,
+            })
+        return {
+            "task_queue": settings.temporal_task_queue,
+            "pollers_count": len(pollers),
+            "pollers": pollers,
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+
 @app.post("/v1/remarketing/workflows")
 async def start_remarketing_workflow(
     payload: StartRemarketingRequest,
