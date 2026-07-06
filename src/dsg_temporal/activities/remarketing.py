@@ -130,8 +130,12 @@ def _throttle_channel(channel: str, min_interval: float) -> float:
         delta = now - last
         if delta < min_interval:
             waited = min_interval - delta
-            time.sleep(waited)
-        _dispatch_last_sent_at[channel] = time.monotonic()
+            _dispatch_last_sent_at[channel] = now + waited
+        else:
+            _dispatch_last_sent_at[channel] = now
+
+    if waited > 0:
+        time.sleep(waited)
     return waited
 
 
@@ -193,19 +197,25 @@ def _apply_whatsapp_pacing(snapshot: dict) -> None:
     max_iv = max(min_iv, int(snapshot.get("max_interval_seconds", 300)))
     target = random.uniform(min_iv, max_iv)
     lock = _dispatch_locks["whatsapp"]
+    
+    wait = 0.0
     with lock:
         now = time.monotonic()
         last = _dispatch_last_sent_at["whatsapp"]
         elapsed = now - last
         if last > 0 and elapsed < target:
             wait = target - elapsed
-            logger.info(
-                "whatsapp pacing: waiting %.1fs (target=%.1fs, elapsed=%.1fs, range=%d..%d)",
-                wait, target, elapsed, min_iv, max_iv,
-            )
-            _heartbeat_safely({"pacing_wait_seconds": wait})
-            _sleep_with_heartbeat(wait)
-        _dispatch_last_sent_at["whatsapp"] = time.monotonic()
+            _dispatch_last_sent_at["whatsapp"] = now + wait
+        else:
+            _dispatch_last_sent_at["whatsapp"] = now
+
+    if wait > 0:
+        logger.info(
+            "whatsapp pacing: waiting %.1fs (target=%.1fs, elapsed=%.1fs, range=%d..%d)",
+            wait, target, elapsed, min_iv, max_iv,
+        )
+        _heartbeat_safely({"pacing_wait_seconds": wait})
+        _sleep_with_heartbeat(wait)
 
 
 @activity.defn
