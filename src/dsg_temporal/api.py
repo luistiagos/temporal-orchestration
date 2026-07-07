@@ -191,7 +191,21 @@ async def debug_workers(request: Request) -> dict[str, Any]:
             ),
         }
 
-    return {"namespace": ns, "queues": queues}
+    # Campos de TOPO retrocompatíveis: o health check do backend (healthcheck.py
+    # _check_temporal) lê `pollers_count` no topo — sem isso ele acha "0 workers"
+    # e marca o Temporal como fora do ar. `pollers_count` = pollers vivos na fila
+    # principal (workflow ou activity, o maior).
+    main = queues.get(settings.temporal_task_queue, {})
+    main_pollers = max(
+        main.get("workflow", {}).get("pollers_count", 0),
+        main.get("activity", {}).get("pollers_count", 0),
+    )
+    return {
+        "namespace": ns,
+        "task_queue": settings.temporal_task_queue,
+        "pollers_count": main_pollers,
+        "queues": queues,
+    }
 
 
 
