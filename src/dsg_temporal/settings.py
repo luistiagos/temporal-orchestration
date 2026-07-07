@@ -82,6 +82,10 @@ class Settings:
     temporal_address: str
     temporal_namespace: str
     temporal_task_queue: str
+    # Fila dedicada das atividades de conversa WhatsApp (pool próprio no worker).
+    # Isola a resposta ao cliente dos sleeps de pacing do remarketing. Vazio =>
+    # sem isolamento (atividade roda na fila do workflow; comportamento legado).
+    temporal_wpp_task_queue: str
     api_host: str
     api_port: int
     legacy_backend_base_url: str
@@ -98,6 +102,9 @@ class Settings:
     assume_purchased_on_check_error: bool
     http_timeout_seconds: int
     activity_max_workers: int
+    # Threads dedicadas às atividades de conversa (pool próprio, separado do
+    # remarketing). Conversas são rápidas (um POST ao backend) → pool pequeno basta.
+    wpp_activity_max_workers: int
     email_min_interval_seconds: int
     remarketing_email_override_to: str
 
@@ -108,6 +115,7 @@ def get_settings() -> Settings:
         temporal_address=_temporal_address_env(),
         temporal_namespace=_str_env("TEMPORAL_NAMESPACE", "default"),
         temporal_task_queue=_str_env("TEMPORAL_TASK_QUEUE", "dsg-orchestrator"),
+        temporal_wpp_task_queue=_str_env("TEMPORAL_WPP_TASK_QUEUE", "dsg-orchestrator-wpp"),
         api_host=_str_env("API_HOST", "0.0.0.0"),
         api_port=_int_env("API_PORT", 8090),
         legacy_backend_base_url=_str_env(
@@ -142,6 +150,7 @@ def get_settings() -> Settings:
         ),
         http_timeout_seconds=_int_env("HTTP_TIMEOUT_SECONDS", 20),
         activity_max_workers=_int_env("ACTIVITY_MAX_WORKERS", 20),
+        wpp_activity_max_workers=_int_env("WPP_ACTIVITY_MAX_WORKERS", 10),
         # Throttle global apenas para EMAIL — WhatsApp tem pacing por config
         # vinda do backend (WhatsAppSenderConfig.min/max_interval_seconds).
         email_min_interval_seconds=_int_env("EMAIL_MIN_INTERVAL_SECONDS", 10),

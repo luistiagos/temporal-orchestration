@@ -148,6 +148,11 @@ class WhatsAppWorkflowInput:
     conversation_id: str
     debounce_seconds: float = 2.5
     initial_message: WhatsAppInboundMessage | None = None
+    # Fila dedicada onde a atividade process_whatsapp_batch é agendada. Quando
+    # None, a atividade roda na própria fila do workflow (comportamento legado).
+    # Isolar a fila/pool das conversas impede que os sleeps de pacing do
+    # remarketing (mesmo ThreadPoolExecutor) starvem a resposta ao cliente.
+    activity_task_queue: str | None = None
     metadata: Metadata = field(default_factory=dict)
 
 
@@ -175,5 +180,8 @@ class WhatsAppWorkflowState:
     processed_batches: int = 0
     last_msg_id: str | None = None
     last_error: str = ""
+    # Falhas consecutivas do batch atual (0 quando saudável). >0 sinaliza que a
+    # conversa está "degraded" e re-tentando — observável por um monitor.
+    consecutive_failures: int = 0
     events: list[WorkflowEvent] = field(default_factory=list)
 

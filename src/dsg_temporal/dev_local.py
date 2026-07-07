@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -74,7 +75,13 @@ async def run_dev_local() -> None:
         )
     )
 
-    with ThreadPoolExecutor(max_workers=settings.activity_max_workers) as activity_executor:
+    wpp_queue = settings.temporal_wpp_task_queue
+    isolate_wpp = bool(wpp_queue) and wpp_queue != settings.temporal_task_queue
+
+    with contextlib.ExitStack() as stack:
+        activity_executor = stack.enter_context(
+            ThreadPoolExecutor(max_workers=settings.activity_max_workers)
+        )
         worker = Worker(
             env.client,
             task_queue=settings.temporal_task_queue,
@@ -87,7 +94,24 @@ async def run_dev_local() -> None:
             ],
             activity_executor=activity_executor,
         )
-        async with worker:
+        workers = [worker]
+
+        if isolate_wpp:
+            wpp_executor = stack.enter_context(
+                ThreadPoolExecutor(max_workers=settings.wpp_activity_max_workers)
+            )
+            workers.append(
+                Worker(
+                    env.client,
+                    task_queue=wpp_queue,
+                    activities=[process_whatsapp_batch],
+                    activity_executor=wpp_executor,
+                )
+            )
+
+        async with contextlib.AsyncExitStack() as astack:
+            for w in workers:
+                await astack.enter_async_context(w)
             try:
                 await server.serve()
             finally:

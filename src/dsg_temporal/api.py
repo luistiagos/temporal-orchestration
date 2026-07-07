@@ -118,6 +118,16 @@ async def health() -> dict[str, str]:
     }
 
 
+@app.get("/version")
+async def version() -> dict[str, Any]:
+    """Commit VIVO deste serviço (mata "fix fantasma"). SEMPRE 200, sem tocar no
+    Temporal. Confirma por fora qual código a API está rodando. O worker loga o
+    mesmo resumo no startup (ele não serve HTTP)."""
+    from dsg_temporal.version import summary
+
+    return summary()
+
+
 @app.get("/debug/workers")
 async def debug_workers(request: Request) -> dict[str, Any]:
     client = temporal_client(request)
@@ -234,11 +244,16 @@ async def ingest_whatsapp_message(
     )
     workflow_id = whatsapp_workflow_id(payload.tenant_id, conversation_id)
     message = payload.inbound_message()
+    # Agenda a atividade de batch na fila dedicada das conversas (pool isolado do
+    # remarketing). Vazio => sem isolamento (roda na fila do workflow). Fixado no
+    # input no START: replays reusam o mesmo valor (determinístico).
+    wpp_activity_queue = settings.temporal_wpp_task_queue or None
     workflow_input = WhatsAppWorkflowInput(
         tenant_id=payload.tenant_id,
         conversation_id=conversation_id,
         debounce_seconds=payload.debounce_seconds,
         initial_message=message,
+        activity_task_queue=wpp_activity_queue,
         metadata=payload.metadata,
     )
 
