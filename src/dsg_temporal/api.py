@@ -128,28 +128,70 @@ async def version() -> dict[str, Any]:
     return summary()
 
 
-@app.get("/debug/workers")
-async def debug_workers(request: Request) -> dict[str, Any]:
-    client = temporal_client(request)
-    settings = get_settings()
+async def _describe_pollers(client: Client, namespace: str, queue_name: str, tq_type) -> dict[str, Any]:
+    """Lista os pollers de uma task_queue (via o workflow_service cru — o Client do
+    temporalio 1.27 não tem describe_task_queue de alto nível)."""
+    from temporalio.api.taskqueue.v1 import TaskQueue
+    from temporalio.api.workflowservice.v1 import DescribeTaskQueueRequest
+
     try:
-        desc = await client.describe_task_queue(
-            settings.temporal_task_queue,
+        resp = await client.workflow_service.describe_task_queue(
+            DescribeTaskQueueRequest(
+                namespace=namespace,
+                task_queue=TaskQueue(name=queue_name),
+                task_queue_type=tq_type,
+            )
         )
-        pollers = []
-        for poller in desc.pollers:
-            pollers.append({
-                "identity": poller.identity,
-                "last_access_time": poller.last_access_time.isoformat() if poller.last_access_time else None,
-                "rate_per_second": poller.rate_per_second,
-            })
-        return {
-            "task_queue": settings.temporal_task_queue,
-            "pollers_count": len(pollers),
-            "pollers": pollers,
-        }
     except Exception as exc:
         return {"error": str(exc)}
+
+    pollers = []
+    for p in resp.pollers:
+        last_access = None
+        try:
+            last_access = p.last_access_time.ToJsonString()
+        except Exception:
+            pass
+        pollers.append(
+            {
+                "identity": p.identity,
+                "last_access_time": last_access,
+                "rate_per_second": p.rate_per_second,
+            }
+        )
+    return {"pollers_count": len(pollers), "pollers": pollers}
+
+
+@app.get("/debug/workers")
+async def debug_workers(request: Request) -> dict[str, Any]:
+    """Pollers vivos por task_queue. Um poller de ATIVIDADE na fila wpp
+    (dsg-orchestrator-wpp) prova que o worker roda o código NOVO (só ele cria
+    esse worker isolado)."""
+    from temporalio.api.enums.v1 import TaskQueueType
+
+    client = temporal_client(request)
+    settings = get_settings()
+    ns = settings.temporal_namespace
+
+    queues: dict[str, Any] = {
+        settings.temporal_task_queue: {
+            "workflow": await _describe_pollers(
+                client, ns, settings.temporal_task_queue, TaskQueueType.TASK_QUEUE_TYPE_WORKFLOW
+            ),
+            "activity": await _describe_pollers(
+                client, ns, settings.temporal_task_queue, TaskQueueType.TASK_QUEUE_TYPE_ACTIVITY
+            ),
+        }
+    }
+    wpp = settings.temporal_wpp_task_queue
+    if wpp and wpp != settings.temporal_task_queue:
+        queues[wpp] = {
+            "activity": await _describe_pollers(
+                client, ns, wpp, TaskQueueType.TASK_QUEUE_TYPE_ACTIVITY
+            ),
+        }
+
+    return {"namespace": ns, "queues": queues}
 
 
 
