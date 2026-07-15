@@ -74,6 +74,7 @@ class DispatchStepInput:
     email: str | None = None
     phone: str | None = None
     product_id: int | str | None = None
+    bypass_pacing: bool = False
     metadata: Metadata = field(default_factory=dict)
 
 

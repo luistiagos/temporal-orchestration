@@ -354,3 +354,30 @@ def test_pause_e_resume():
     paused, status = asyncio.run(run())
     assert paused is True
     assert status == "completed"
+
+
+def test_whatsapp_pacing_workflow_sleep():
+    calls = []
+
+    @activity.defn(name="dispatch_remarketing_step")
+    def _dispatch(payload: DispatchStepInput) -> DispatchResult:
+        calls.append(payload.bypass_pacing)
+        if not payload.bypass_pacing:
+            return DispatchResult(status="pacing_required", raw={"wait_seconds": 120})
+        return DispatchResult(status="sent")
+
+    async def run():
+        return await _run(
+            _input([_whatsapp_step()]),
+            _make_check_purchase(purchased=False),
+            _dispatch,
+        )
+
+    result = asyncio.run(run())
+    assert result.status == "completed"
+    assert len(result.sent_steps) == 1
+    assert result.sent_steps[0].status == "sent"
+    assert calls == [False, True]
+    
+    event_types = [e.event_type for e in result.events]
+    assert "whatsapp_pacing_wait" in event_types

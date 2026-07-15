@@ -190,9 +190,9 @@ def _sleep_with_heartbeat(total_seconds: float, chunk_seconds: float = 30.0) -> 
         _heartbeat_safely({"sleep_remaining_seconds": remaining})
 
 
-def _apply_whatsapp_pacing(snapshot: dict) -> None:
+def _apply_whatsapp_pacing(snapshot: dict) -> float:
     """Aplica o pacing aleatório (min..max) entre dois envios WhatsApp no
-    mesmo worker, usando o lock global do canal."""
+    mesmo worker, usando o lock global do canal. Retorna os segundos de wait."""
     min_iv = max(1, int(snapshot.get("min_interval_seconds", 90)))
     max_iv = max(min_iv, int(snapshot.get("max_interval_seconds", 300)))
     target = random.uniform(min_iv, max_iv)
@@ -211,11 +211,10 @@ def _apply_whatsapp_pacing(snapshot: dict) -> None:
 
     if wait > 0:
         logger.info(
-            "whatsapp pacing: waiting %.1fs (target=%.1fs, elapsed=%.1fs, range=%d..%d)",
+            "whatsapp pacing required: wait %.1fs (target=%.1fs, elapsed=%.1fs, range=%d..%d)",
             wait, target, elapsed, min_iv, max_iv,
         )
-        _heartbeat_safely({"pacing_wait_seconds": wait})
-        _sleep_with_heartbeat(wait)
+    return wait
 
 
 @activity.defn
@@ -279,7 +278,16 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
             dispatch_phone = override
 
         # Aplica o pacing aleatório min..max (lock global do worker).
-        _apply_whatsapp_pacing(snapshot)
+        if not payload.bypass_pacing:
+            wait = _apply_whatsapp_pacing(snapshot)
+            if wait > 0:
+                return DispatchResult(
+                    status="pacing_required",
+                    reason=f"whatsapp pacing required: {wait:.1f}s",
+                    raw={"wait_seconds": wait},
+                )
+        else:
+            logger.info("whatsapp pacing bypassed (pre-slept in workflow)")
     elif channel == "email":
         waited = _throttle_channel("email", settings.email_min_interval_seconds)
         if waited > 0:

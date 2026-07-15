@@ -359,6 +359,7 @@ class LeadRemarketingWorkflow:
         max_attempts = len(retry_waits_seconds)
 
         attempts = 0
+        bypass_pacing = False
         while True:
             attempts += 1
             self._state.status = "dispatching"
@@ -377,12 +378,32 @@ class LeadRemarketingWorkflow:
                     email=payload.email,
                     phone=payload.phone,
                     product_id=payload.product_id,
+                    bypass_pacing=bypass_pacing,
                     metadata=payload.metadata,
                 ),
                 start_to_close_timeout=timeout,
                 heartbeat_timeout=timedelta(minutes=2) if channel == "whatsapp" else None,
                 retry_policy=RetryPolicy(maximum_attempts=1),
             )
+
+            if channel == "whatsapp" and result.status == "pacing_required":
+                wait_s = float((result.raw or {}).get("wait_seconds", 0.0))
+                if wait_s > 0:
+                    self._state.status = "waiting_pacing"
+                    self._add_event(
+                        "whatsapp_pacing_wait",
+                        f"WhatsApp pacing: sleeping {int(wait_s)}s before dispatch",
+                        {
+                            "step_id": step.step_id,
+                            "cycle": cycle,
+                            "wait_seconds": wait_s,
+                        },
+                    )
+                    await self._notify_last_event()
+                    await workflow.sleep(timedelta(seconds=wait_s))
+                bypass_pacing = True
+                attempts -= 1
+                continue
 
             # WhatsApp: cap diário atingido → o workflow dorme até a próxima
             # janela de ENVIO e tenta de novo o mesmo step. O cap reseta à
