@@ -280,9 +280,18 @@ async def describe_workflow(workflow_id: str, request: Request) -> Any:
                 "last_heartbeat_details": hb_details,
                 "last_worker_identity": act.last_worker_identity,
             })
+
+        failure_reason = None
+        if str(desc.status) == "WorkflowExecutionStatus.FAILED" or desc.status == 3:
+            try:
+                await handle.result()
+            except Exception as e:
+                failure_reason = f"{type(e).__name__}: {str(e)}"
+
         return {
             "workflow_id": workflow_id,
             "status": str(desc.status),
+            "failure_reason": failure_reason,
             "pending_activities": pending_activities,
         }
     except Exception as exc:
