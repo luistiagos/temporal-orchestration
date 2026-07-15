@@ -16,6 +16,11 @@ WHATSAPP_TZ_OFFSET_HOURS = -3
 WHATSAPP_WINDOW_START_HOUR = 9
 WHATSAPP_WINDOW_END_HOUR = 20  # 20:00 = limite superior (não envia >= 20:00)
 
+# Espera de pacing a partir da qual a compra é re-checada antes do envio.
+# check_purchase roda antes de entrar na fila de pacing; com ~1 posição de
+# fila em prod (min..max 400..800s) o lead pode comprar enquanto espera.
+PACING_RECHECK_PURCHASE_SECONDS = 600
+
 
 def _normalize_window(start_hour: int | None, end_hour: int | None) -> tuple[int, int]:
     """Normaliza (start, end) em horas inteiras BRT. start 0–23, end 1–24, e
@@ -180,26 +185,7 @@ class LeadRemarketingWorkflow:
                     return self._state
 
                 try:
-                    purchase = await workflow.execute_activity(
-                        check_purchase,
-                        PurchaseCheckInput(
-                            tenant_id=payload.tenant_id,
-                            lead_id=payload.lead_id,
-                            email=payload.email,
-                            phone=payload.phone,
-                            userip=payload.userip,
-                            fbp=payload.fbp,
-                            product_id=payload.product_id,
-                            metadata=payload.metadata,
-                        ),
-                        start_to_close_timeout=timedelta(seconds=30),
-                        retry_policy=RetryPolicy(
-                            initial_interval=timedelta(seconds=10),
-                            backoff_coefficient=2.0,
-                            maximum_interval=timedelta(minutes=5),
-                            maximum_attempts=5,
-                        ),
-                    )
+                    purchase = await self._run_purchase_check()
                 except Exception as exc:
                     # Todas as retentativas esgotadas. NÃO assumimos compra —
                     # o status fica 'error' para tornar a falha visível e
@@ -338,6 +324,34 @@ class LeadRemarketingWorkflow:
     def state(self) -> RemarketingWorkflowState:
         return self._state
 
+    async def _run_purchase_check(self):
+        """Executa a activity check_purchase com a política de retry padrão.
+        Fonte única do portão de compra — usada antes de cada step e no
+        re-check pós-espera longa de pacing. Propaga a exceção se todas as
+        retentativas falharem."""
+        assert self._input is not None
+        payload = self._input
+        return await workflow.execute_activity(
+            check_purchase,
+            PurchaseCheckInput(
+                tenant_id=payload.tenant_id,
+                lead_id=payload.lead_id,
+                email=payload.email,
+                phone=payload.phone,
+                userip=payload.userip,
+                fbp=payload.fbp,
+                product_id=payload.product_id,
+                metadata=payload.metadata,
+            ),
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(seconds=10),
+                backoff_coefficient=2.0,
+                maximum_interval=timedelta(minutes=5),
+                maximum_attempts=5,
+            ),
+        )
+
     async def _dispatch_with_manual_unknown_gate(self, step, cycle: int) -> DispatchResult:
         assert self._input is not None
         payload = self._input
@@ -363,9 +377,10 @@ class LeadRemarketingWorkflow:
         while True:
             attempts += 1
             self._state.status = "dispatching"
-            # WhatsApp pode esperar até max_interval (default 300s) + HTTP +
-            # heartbeat — 30 min é folga confortável.
-            timeout = timedelta(minutes=30) if channel == "whatsapp" else timedelta(minutes=10)
+            # A activity não dorme mais (pacing devolve pacing_required na
+            # hora): o que resta são 2 HTTPs de ~20s. 3 min de folga deixa
+            # falha real visível em minutos, não em meia hora.
+            timeout = timedelta(minutes=3) if channel == "whatsapp" else timedelta(minutes=10)
             result = await workflow.execute_activity(
                 dispatch_remarketing_step,
                 DispatchStepInput(
@@ -382,7 +397,6 @@ class LeadRemarketingWorkflow:
                     metadata=payload.metadata,
                 ),
                 start_to_close_timeout=timeout,
-                heartbeat_timeout=timedelta(minutes=2) if channel == "whatsapp" else None,
                 retry_policy=RetryPolicy(maximum_attempts=1),
             )
 
@@ -401,6 +415,64 @@ class LeadRemarketingWorkflow:
                     )
                     await self._notify_last_event()
                     await workflow.sleep(timedelta(seconds=wait_s))
+                if self._cancel_requested or self._purchase_confirmed:
+                    return DispatchResult(status="skipped", reason="workflow stopped")
+
+                # A espera na fila pode ter cruzado o fim da janela de envio
+                # (cauda da fila passando das 20:00 BRT). Dorme até a próxima
+                # janela e volta para a FILA de pacing (bypass off) em vez de
+                # furar o horário comercial.
+                now_utc = workflow.now()
+                allowed_at = _whatsapp_next_allowed(
+                    now_utc, payload.window_start_hour, payload.window_end_hour
+                )
+                if allowed_at > now_utc:
+                    window_wait = (allowed_at - now_utc).total_seconds()
+                    self._state.status = "waiting_window"
+                    self._add_event(
+                        "send_window_wait",
+                        f"Pacing wait crossed send window — postponed {int(window_wait // 60)} min",
+                        {
+                            "allowed_at_iso": allowed_at.isoformat(),
+                            "step_id": step.step_id,
+                            "cycle": cycle,
+                        },
+                    )
+                    await self._notify_last_event()
+                    await workflow.sleep(timedelta(seconds=window_wait))
+                    if self._cancel_requested or self._purchase_confirmed:
+                        return DispatchResult(status="skipped", reason="workflow stopped")
+                    bypass_pacing = False
+                    attempts = 0
+                    continue
+
+                # Espera longa: o lead pode ter comprado enquanto aguardava na
+                # fila (nada no backend emite o signal purchase_confirmed hoje).
+                # Best-effort: se o re-check falhar após as retentativas, envia
+                # mesmo assim — o portão duro antes da fila continua fail-closed.
+                if wait_s >= PACING_RECHECK_PURCHASE_SECONDS:
+                    try:
+                        purchase = await self._run_purchase_check()
+                    except Exception as exc:
+                        purchase = None
+                        self._add_event(
+                            "purchase_recheck_failed",
+                            f"purchase re-check after pacing wait failed: {str(exc)[:200]}",
+                            {"step_id": step.step_id, "cycle": cycle},
+                        )
+                        await self._notify_last_event()
+                    if purchase is not None and purchase.purchased:
+                        self._purchase_confirmed = True
+                        self._add_event(
+                            "workflow_stopped",
+                            purchase.reason or "Lead purchased during pacing wait",
+                            {"step_id": step.step_id, "cycle": cycle},
+                        )
+                        await self._notify_last_event()
+                        return DispatchResult(
+                            status="skipped", reason="lead purchased during pacing wait"
+                        )
+
                 bypass_pacing = True
                 attempts -= 1
                 continue
@@ -436,7 +508,12 @@ class LeadRemarketingWorkflow:
                 if self._cancel_requested or self._purchase_confirmed:
                     return DispatchResult(status="skipped", reason="workflow stopped")
                 # Reset attempts: a espera não conta como tentativa real.
+                # bypass_pacing volta a False: quem acorda na abertura da
+                # janela entra na FILA de pacing — sem isso, N workflows que
+                # passaram por pacing antes do cap disparariam em rajada às
+                # 09:00 sem intervalo entre si.
                 attempts = 0
+                bypass_pacing = False
                 continue
 
             if result.status != "unknown":

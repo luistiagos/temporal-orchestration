@@ -86,7 +86,10 @@ def _whatsapp_step(step_id="wpp-1", delay_minutes=0):
     )
 
 
-def _input(sequence, *, max_cycles=1, stop_on_step_failure=True):
+def _input(sequence, *, max_cycles=1, stop_on_step_failure=True,
+           window_start_hour=None, window_end_hour=None):
+    # window 0–24 nos testes de pacing = "janela sempre aberta", para o
+    # resultado não depender da hora do dia em que a suíte roda.
     return LeadRemarketingInput(
         tenant_id="test",
         lead_id=999,
@@ -95,6 +98,8 @@ def _input(sequence, *, max_cycles=1, stop_on_step_failure=True):
         phone="(41) 98531-1304",
         max_cycles=max_cycles,
         stop_on_step_failure=stop_on_step_failure,
+        window_start_hour=window_start_hour,
+        window_end_hour=window_end_hour,
         sequence=sequence,
     )
 
@@ -368,7 +373,7 @@ def test_whatsapp_pacing_workflow_sleep():
 
     async def run():
         return await _run(
-            _input([_whatsapp_step()]),
+            _input([_whatsapp_step()], window_start_hour=0, window_end_hour=24),
             _make_check_purchase(purchased=False),
             _dispatch,
         )
@@ -378,6 +383,181 @@ def test_whatsapp_pacing_workflow_sleep():
     assert len(result.sent_steps) == 1
     assert result.sent_steps[0].status == "sent"
     assert calls == [False, True]
-    
+
     event_types = [e.event_type for e in result.events]
     assert "whatsapp_pacing_wait" in event_types
+
+
+def test_pacing_apos_cap_volta_para_a_fila_sem_bypass():
+    """G1: quem passou por pacing e caiu no cap NÃO pode acordar às 09:00
+    com bypass ligado — o dispatch pós-cap deve voltar com bypass_pacing=False
+    (entra na fila de pacing em vez de disparar em rajada)."""
+    calls = []
+
+    @activity.defn(name="dispatch_remarketing_step")
+    def _dispatch(payload: DispatchStepInput) -> DispatchResult:
+        calls.append(payload.bypass_pacing)
+        if len(calls) == 1:
+            return DispatchResult(status="pacing_required", raw={"wait_seconds": 5})
+        if len(calls) == 2:
+            return DispatchResult(status="cap_reached", raw={"next_window_seconds": 60})
+        return DispatchResult(status="sent")
+
+    async def run():
+        return await _run(
+            _input([_whatsapp_step()], window_start_hour=0, window_end_hour=24),
+            _make_check_purchase(purchased=False),
+            _dispatch,
+        )
+
+    result = asyncio.run(run())
+    assert result.status == "completed"
+    assert result.sent_steps[0].status == "sent"
+    assert calls == [False, True, False]
+
+
+def test_pacing_que_cruza_a_janela_re_adia_e_reseta_bypass():
+    """G3: a espera na fila de pacing pode cruzar o fim da janela de envio
+    (20:00 BRT). O workflow deve re-adiar para a próxima janela e voltar para
+    a fila (bypass off), nunca enviar fora do horário comercial."""
+    calls = []
+
+    @activity.defn(name="dispatch_remarketing_step")
+    def _dispatch(payload: DispatchStepInput) -> DispatchResult:
+        calls.append(payload.bypass_pacing)
+        if len(calls) == 1:
+            # 12h de espera > 11h de janela (09–20) => cruza o fim SEMPRE,
+            # independente da hora em que o teste roda.
+            return DispatchResult(status="pacing_required", raw={"wait_seconds": 12 * 3600})
+        return DispatchResult(status="sent")
+
+    async def run():
+        return await _run(
+            _input([_whatsapp_step()], window_start_hour=9, window_end_hour=20),
+            _make_check_purchase(purchased=False),
+            _dispatch,
+        )
+
+    result = asyncio.run(run())
+    assert result.status == "completed"
+    assert result.sent_steps[0].status == "sent"
+    # O 2º dispatch veio SEM bypass (voltou para a fila após re-adiar).
+    assert calls == [False, False]
+    event_types = [e.event_type for e in result.events]
+    idx_pacing = event_types.index("whatsapp_pacing_wait")
+    assert "send_window_wait" in event_types[idx_pacing:]
+
+
+def test_purchase_confirmed_durante_pacing_nao_envia():
+    """G2: signal purchase_confirmed recebido DURANTE o sleep de pacing deve
+    impedir o envio (antes o branch de pacing não checava signals)."""
+    calls = []
+
+    @activity.defn(name="dispatch_remarketing_step")
+    def _dispatch(payload: DispatchStepInput) -> DispatchResult:
+        calls.append(payload.bypass_pacing)
+        if len(calls) == 1:
+            return DispatchResult(status="pacing_required", raw={"wait_seconds": 100000})
+        return DispatchResult(status="sent")
+
+    async def run():
+        task_queue = _task_queue()
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                async with Worker(
+                    env.client,
+                    task_queue=task_queue,
+                    workflows=[LeadRemarketingWorkflow],
+                    activities=[
+                        _make_check_purchase(purchased=False),
+                        _dispatch,
+                        _mock_notify,
+                    ],
+                    activity_executor=executor,
+                ):
+                    handle = await env.client.start_workflow(
+                        LeadRemarketingWorkflow.run,
+                        _input([_whatsapp_step()], window_start_hour=0, window_end_hour=24),
+                        id=f"test-{uuid.uuid4().hex}",
+                        task_queue=task_queue,
+                        execution_timeout=timedelta(days=60),
+                    )
+                    # Espera o workflow entrar no sleep de pacing.
+                    for _ in range(100):
+                        st = await handle.query(LeadRemarketingWorkflow.state)
+                        if st.status == "waiting_pacing":
+                            break
+                        await asyncio.sleep(0.1)
+                    await handle.signal(LeadRemarketingWorkflow.purchase_confirmed)
+                    return await handle.result()
+
+    result = asyncio.run(run())
+    # Só o 1º dispatch aconteceu; o envio pós-sleep foi suprimido.
+    assert calls == [False]
+    assert all(s.status != "sent" for s in result.sent_steps)
+
+
+def test_espera_longa_recheca_compra_e_encerra_purchased():
+    """G4: espera de pacing >= PACING_RECHECK_PURCHASE_SECONDS deve re-checar
+    a compra antes do envio — o lead pode ter comprado enquanto esperava na
+    fila (nada no backend emite o signal purchase_confirmed)."""
+    dispatch_calls = []
+    check_calls = {"n": 0}
+
+    @activity.defn(name="check_purchase")
+    def _check(payload: PurchaseCheckInput) -> PurchaseCheckResult:
+        check_calls["n"] += 1
+        # 1ª checagem (portão do step): não comprou. Re-check pós-fila: comprou.
+        return PurchaseCheckResult(purchased=check_calls["n"] >= 2)
+
+    @activity.defn(name="dispatch_remarketing_step")
+    def _dispatch(payload: DispatchStepInput) -> DispatchResult:
+        dispatch_calls.append(payload.bypass_pacing)
+        if len(dispatch_calls) == 1:
+            return DispatchResult(status="pacing_required", raw={"wait_seconds": 700})
+        return DispatchResult(status="sent")
+
+    async def run():
+        return await _run(
+            _input(
+                [_whatsapp_step("wpp-1"), _whatsapp_step("wpp-2")],
+                window_start_hour=0, window_end_hour=24,
+            ),
+            _check,
+            _dispatch,
+        )
+
+    result = asyncio.run(run())
+    # Comprou durante a fila: nada foi enviado e a sequência parou.
+    assert result.status == "purchased"
+    assert dispatch_calls == [False]
+    assert check_calls["n"] == 2
+    assert all(s.status != "sent" for s in result.sent_steps)
+
+
+def test_pacing_required_repetido_no_bypass_re_dorme():
+    """G5 (lado workflow): a activity pode devolver pacing_required de novo
+    mesmo com bypass=True (piso contra o DB pós-restart do worker). O
+    workflow deve dormir de novo e re-tentar, não falhar."""
+    calls = []
+
+    @activity.defn(name="dispatch_remarketing_step")
+    def _dispatch(payload: DispatchStepInput) -> DispatchResult:
+        calls.append(payload.bypass_pacing)
+        if len(calls) <= 2:
+            return DispatchResult(status="pacing_required", raw={"wait_seconds": 30})
+        return DispatchResult(status="sent")
+
+    async def run():
+        return await _run(
+            _input([_whatsapp_step()], window_start_hour=0, window_end_hour=24),
+            _make_check_purchase(purchased=False),
+            _dispatch,
+        )
+
+    result = asyncio.run(run())
+    assert result.status == "completed"
+    assert result.sent_steps[0].status == "sent"
+    assert calls == [False, True, True]
+    event_types = [e.event_type for e in result.events]
+    assert event_types.count("whatsapp_pacing_wait") == 2

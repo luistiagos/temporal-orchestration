@@ -5,6 +5,7 @@ import logging
 import random
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urljoin
 
@@ -171,23 +172,32 @@ def _fetch_wpp_sender_snapshot() -> dict | None:
         return None
 
 
-def _heartbeat_safely(payload: Any = None) -> None:
-    """Emite heartbeat — silencioso se a activity não tiver contexto (testes)."""
+def _elapsed_since_last_db_send(snapshot: dict) -> float | None:
+    """Segundos desde o último envio WhatsApp REAL segundo o backend
+    (snapshot['last_sent_at_iso'], lido de SentCampaign — fonte da verdade).
+    None quando o snapshot não traz o campo ou ele é inválido."""
+    iso = snapshot.get("last_sent_at_iso")
+    if not iso:
+        return None
     try:
-        activity.heartbeat(payload)
-    except Exception:
-        pass
+        last = datetime.fromisoformat(str(iso))
+    except ValueError:
+        return None
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - last).total_seconds())
 
 
-def _sleep_with_heartbeat(total_seconds: float, chunk_seconds: float = 30.0) -> None:
-    """Dorme em chunks emitindo heartbeats. Necessário para sleeps longos
-    em activities com heartbeat_timeout configurado."""
-    remaining = float(total_seconds)
-    while remaining > 0:
-        step = min(chunk_seconds, remaining)
-        time.sleep(step)
-        remaining -= step
-        _heartbeat_safely({"sleep_remaining_seconds": remaining})
+def _whatsapp_floor_wait(snapshot: dict) -> float:
+    """Piso de pacing contra o DB para envios com bypass_pacing=True.
+    Bypass pula a FILA em memória do worker, não a REGRA: se o último envio
+    real (DB) foi há menos de min_interval, devolve quanto falta esperar
+    (+ jitter para desalinhar workflows que acordam juntos pós-restart)."""
+    min_iv = max(1, int(snapshot.get("min_interval_seconds", 90)))
+    elapsed = _elapsed_since_last_db_send(snapshot)
+    if elapsed is None or elapsed >= min_iv:
+        return 0.0
+    return (min_iv - elapsed) + random.uniform(1.0, 30.0)
 
 
 def _apply_whatsapp_pacing(snapshot: dict) -> float:
@@ -197,13 +207,22 @@ def _apply_whatsapp_pacing(snapshot: dict) -> float:
     max_iv = max(min_iv, int(snapshot.get("max_interval_seconds", 300)))
     target = random.uniform(min_iv, max_iv)
     lock = _dispatch_locks["whatsapp"]
-    
+
+    # Worker recém-(re)iniciado: a memória do processo zera, mas o DB sabe
+    # quando foi o último envio real — semeia o elapsed para não liberar um
+    # envio imediato logo após restart/deploy.
+    elapsed_db = _elapsed_since_last_db_send(snapshot)
+
     wait = 0.0
+    elapsed: float | None = None
     with lock:
         now = time.monotonic()
         last = _dispatch_last_sent_at["whatsapp"]
-        elapsed = now - last
-        if last > 0 and elapsed < target:
+        if last > 0:
+            elapsed = now - last
+        elif elapsed_db is not None:
+            elapsed = elapsed_db
+        if elapsed is not None and elapsed < target:
             wait = target - elapsed
             _dispatch_last_sent_at["whatsapp"] = now + wait
         else:
@@ -287,6 +306,20 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
                     raw={"wait_seconds": wait},
                 )
         else:
+            # Bypass pula a fila em memória, não a regra: piso de
+            # min_interval contra o último envio real (DB). Segura rajadas
+            # quando o worker reiniciou durante os sleeps dos workflows.
+            floor_wait = _whatsapp_floor_wait(snapshot)
+            if floor_wait > 0:
+                logger.info(
+                    "whatsapp pacing floor engaged despite bypass: wait %.1fs",
+                    floor_wait,
+                )
+                return DispatchResult(
+                    status="pacing_required",
+                    reason=f"whatsapp pacing floor: {floor_wait:.1f}s",
+                    raw={"wait_seconds": floor_wait},
+                )
             logger.info("whatsapp pacing bypassed (pre-slept in workflow)")
     elif channel == "email":
         waited = _throttle_channel("email", settings.email_min_interval_seconds)

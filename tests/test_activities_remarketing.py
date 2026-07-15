@@ -8,11 +8,14 @@ Cobre: CHK-01/02/03/05/07, EMAIL-01, WPP-02/04/07, CB-10.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import responses
 
+from dsg_temporal.activities import remarketing as remarketing_activities
 from dsg_temporal.activities.remarketing import (
+    _apply_whatsapp_pacing,
     check_purchase,
     dispatch_remarketing_step,
     notify_remarketing_event,
@@ -31,6 +34,16 @@ from dsg_temporal.settings import get_settings
 pytestmark = pytest.mark.unit
 
 BASE = "http://backend.test"
+
+
+@pytest.fixture(autouse=True)
+def _reset_wpp_pacing_state():
+    """Zera o estado de pacing em memória entre testes: o pacing devolve
+    pacing_required em vez de dormir, então estado residual de um teste
+    anterior mudaria o resultado do seguinte."""
+    remarketing_activities._dispatch_last_sent_at["whatsapp"] = 0.0
+    remarketing_activities._dispatch_last_sent_at["email"] = 0.0
+    yield
 
 
 @pytest.fixture
@@ -247,6 +260,72 @@ class TestDispatchWhatsApp:
         # 2 chamadas: snapshot e o envio. A última carrega o telefone de teste.
         send_url = responses.calls[-1].request.url
         assert "5541985311304" in send_url
+
+
+# ===========================================================================
+# dispatch_remarketing_step — piso de pacing no bypass + semeadura pós-restart
+# ===========================================================================
+
+class TestWhatsAppPacingFloor:
+    """bypass_pacing pula a FILA em memória, não a REGRA: o piso usa
+    snapshot['last_sent_at_iso'] (DB) para segurar rajadas pós-restart."""
+
+    def _snapshot(self, **over):
+        snap = dict(enabled=True, sent_today=0, max_per_day=30,
+                    min_interval_seconds=400, max_interval_seconds=800,
+                    test_mode_enabled=False, test_phone="",
+                    next_window_starts_in_seconds=3600)
+        snap.update(over)
+        return snap
+
+    @responses.activate
+    def test_bypass_com_envio_recente_no_db_devolve_pacing_required(self, settings_env):
+        recent = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+        responses.add(responses.GET, f"{BASE}/admin/wpp-sender/snapshot",
+                      json=self._snapshot(last_sent_at_iso=recent), status=200)
+        result = dispatch_remarketing_step(_dispatch_input("whatsapp", bypass_pacing=True))
+        assert result.status == "pacing_required"
+        wait = float(result.raw["wait_seconds"])
+        # min_interval(400) - elapsed(~30) + jitter(1..30)
+        assert 365 <= wait <= 405
+
+    @responses.activate
+    def test_bypass_com_envio_antigo_no_db_envia(self, settings_env):
+        old = (datetime.now(timezone.utc) - timedelta(seconds=9999)).isoformat()
+        responses.add(responses.GET, f"{BASE}/admin/wpp-sender/snapshot",
+                      json=self._snapshot(last_sent_at_iso=old), status=200)
+        responses.add(responses.GET, f"{BASE}/remarket_whatsapp_ai",
+                      json={"ok": True, "message_id": "abc"}, status=200)
+        result = dispatch_remarketing_step(_dispatch_input("whatsapp", bypass_pacing=True))
+        assert result.status == "sent"
+
+    @responses.activate
+    def test_bypass_sem_last_sent_no_db_envia(self, settings_env):
+        # Sem last_sent_at_iso no snapshot (nunca enviou), o piso não segura.
+        responses.add(responses.GET, f"{BASE}/admin/wpp-sender/snapshot",
+                      json=self._snapshot(), status=200)
+        responses.add(responses.GET, f"{BASE}/remarket_whatsapp_ai",
+                      json={"ok": True}, status=200)
+        result = dispatch_remarketing_step(_dispatch_input("whatsapp", bypass_pacing=True))
+        assert result.status == "sent"
+
+    def test_semeadura_pos_restart_usa_o_db(self):
+        # Memória zerada (worker recém-subido) + envio real há 40s no DB:
+        # o pacing deve esperar target(100) - 40 ≈ 60s, não liberar na hora.
+        recent = (datetime.now(timezone.utc) - timedelta(seconds=40)).isoformat()
+        wait = _apply_whatsapp_pacing({
+            "min_interval_seconds": 100,
+            "max_interval_seconds": 100,
+            "last_sent_at_iso": recent,
+        })
+        assert 55 <= wait <= 65
+
+    def test_sem_memoria_e_sem_db_envia_imediato(self):
+        wait = _apply_whatsapp_pacing({
+            "min_interval_seconds": 100,
+            "max_interval_seconds": 100,
+        })
+        assert wait == 0.0
 
 
 # ===========================================================================
