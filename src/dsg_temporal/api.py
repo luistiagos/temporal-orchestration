@@ -286,7 +286,12 @@ async def describe_workflow(workflow_id: str, request: Request) -> Any:
             try:
                 await handle.result()
             except Exception as e:
-                failure_reason = f"{type(e).__name__}: {str(e)}"
+                err_msg = f"{type(e).__name__}: {str(e)}"
+                cause = getattr(e, "cause", None)
+                while cause:
+                    err_msg += f" -> {type(cause).__name__}: {str(cause)}"
+                    cause = getattr(cause, "cause", None)
+                failure_reason = err_msg
 
         return {
             "workflow_id": workflow_id,
