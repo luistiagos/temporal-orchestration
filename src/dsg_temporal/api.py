@@ -241,6 +241,54 @@ async def get_remarketing_state(workflow_id: str, request: Request) -> Any:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.get("/v1/remarketing/workflows/{workflow_id}/describe")
+async def describe_workflow(workflow_id: str, request: Request) -> Any:
+    from temporalio.api.enums.v1 import PendingActivityState
+    client = temporal_client(request)
+    handle = client.get_workflow_handle(workflow_id)
+    try:
+        desc = await handle.describe()
+        pending_activities = []
+        raw_desc = desc.raw_description
+        for act in raw_desc.pending_activities:
+            hb_details = None
+            if act.heartbeat_details and len(act.heartbeat_details.payloads) > 0:
+                try:
+                    hb_details = client.data_converter.from_payloads(act.heartbeat_details)[0]
+                except Exception as e:
+                    hb_details = f"decode_failed: {e}"
+            
+            last_hb_time = None
+            try:
+                if act.HasField("last_heartbeat_time"):
+                    last_hb_time = act.last_heartbeat_time.ToDatetime().isoformat()
+            except Exception:
+                pass
+
+            state_name = "UNKNOWN"
+            try:
+                state_name = PendingActivityState.Name(act.state)
+            except Exception:
+                pass
+
+            pending_activities.append({
+                "activity_id": act.activity_id,
+                "activity_type": act.activity_type.name,
+                "state": state_name,
+                "attempt": act.attempt,
+                "last_heartbeat_time": last_hb_time,
+                "last_heartbeat_details": hb_details,
+                "last_worker_identity": act.last_worker_identity,
+            })
+        return {
+            "workflow_id": workflow_id,
+            "status": str(desc.status),
+            "pending_activities": pending_activities,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @app.post("/v1/remarketing/workflows/{workflow_id}/purchase")
 async def signal_purchase(workflow_id: str, payload: SignalPayload, request: Request) -> dict[str, str]:
     handle = temporal_client(request).get_workflow_handle(workflow_id)
