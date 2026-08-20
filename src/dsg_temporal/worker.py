@@ -10,6 +10,7 @@ from temporalio.worker import Worker
 
 from dsg_temporal.activities import (
     check_purchase,
+    describe_whatsapp_image,
     dispatch_remarketing_step,
     notify_remarketing_event,
     process_whatsapp_batch,
@@ -49,6 +50,7 @@ async def run_worker() -> None:
             workflows=[LeadRemarketingWorkflow, WhatsAppConversationWorkflow],
             activities=[
                 check_purchase,
+                describe_whatsapp_image,
                 dispatch_remarketing_step,
                 notify_remarketing_event,
                 process_whatsapp_batch,
@@ -67,7 +69,7 @@ async def run_worker() -> None:
             wpp_worker = Worker(
                 client,
                 task_queue=wpp_queue,
-                activities=[process_whatsapp_batch],
+                activities=[describe_whatsapp_image, process_whatsapp_batch],
                 activity_executor=wpp_executor,
             )
             runners.append(wpp_worker.run())

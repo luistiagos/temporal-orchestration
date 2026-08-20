@@ -13,6 +13,7 @@ def post_legacy_json(
     payload: dict[str, Any],
     *,
     idempotency_key: str | None = None,
+    timeout: float | None = None,
 ) -> requests.Response:
     settings = get_settings()
     url = urljoin(settings.legacy_backend_base_url + "/", path.lstrip("/"))
@@ -30,7 +31,7 @@ def post_legacy_json(
         url,
         json=payload,
         headers=headers,
-        timeout=settings.http_timeout_seconds,
+        timeout=settings.http_timeout_seconds if timeout is None else timeout,
     )
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
 
 from temporalio import workflow
@@ -7,6 +8,7 @@ from temporalio.common import RetryPolicy
 
 from dsg_temporal.schemas import (
     WhatsAppBatchInput,
+    WhatsAppImageDescriptionInput,
     WhatsAppInboundMessage,
     WhatsAppWorkflowInput,
     WhatsAppWorkflowState,
@@ -14,7 +16,10 @@ from dsg_temporal.schemas import (
 )
 
 with workflow.unsafe.imports_passed_through():
-    from dsg_temporal.activities.whatsapp import process_whatsapp_batch
+    from dsg_temporal.activities.whatsapp import (
+        describe_whatsapp_image,
+        process_whatsapp_batch,
+    )
 
 
 # Máximo de msg_ids lembrados para deduplicação (ao longo da conversa). Limita o
@@ -29,6 +34,18 @@ _SEEN_MSG_ID_LIMIT = 500
 _ACTIVITY_SCHEDULE_TO_START = timedelta(seconds=90)
 _ACTIVITY_START_TO_CLOSE = timedelta(minutes=3)
 _ACTIVITY_SCHEDULE_TO_CLOSE = timedelta(minutes=15)
+
+# Bounds da leitura de imagem. Teto por tentativa maior que o HTTP do backend (45s)
+# para o timeout ser dele, nao nosso. schedule_to_close curto de proposito: o cliente
+# esta esperando resposta — depois de ~2min nao adianta mais ler o print, e melhor
+# responder sem ele (o agente sabe dizer que o print nao abriu) do que calar.
+_DESCRIBE_SCHEDULE_TO_START = timedelta(seconds=60)
+_DESCRIBE_START_TO_CLOSE = timedelta(seconds=75)
+_DESCRIBE_SCHEDULE_TO_CLOSE = timedelta(minutes=2)
+
+# Teto de imagens lidas por batch. Cliente que manda 6 prints de uma vez nao pode
+# empurrar a resposta para depois de 2 minutos; o excedente segue como "[IMAGEM]" cru.
+_MAX_IMAGES_PER_BATCH = 3
 
 
 @workflow.defn
@@ -75,6 +92,8 @@ class WhatsAppConversationWorkflow:
             activity_kwargs: dict = {}
             if payload.activity_task_queue:
                 activity_kwargs["task_queue"] = payload.activity_task_queue
+
+            batch = await self._describe_images(payload, batch, activity_kwargs)
 
             try:
                 result = await workflow.execute_activity(
@@ -125,6 +144,92 @@ class WhatsAppConversationWorkflow:
         self._state.status = "canceled"
         self._add_event("workflow_canceled", "Canceled")
         return self._state
+
+    async def _describe_images(
+        self,
+        payload: WhatsAppWorkflowInput,
+        batch: list[WhatsAppInboundMessage],
+        activity_kwargs: dict,
+    ) -> list[WhatsAppInboundMessage]:
+        """Le os prints do batch ANTES de mandar processar, e devolve o batch com o
+        texto enriquecido ("[IMAGEM] ... [DESCRIÇÃO]: ...").
+
+        Por que aqui e nao no backend: rodando como atividade, a leitura ganha
+        retry/timeout duraveis do Temporal e — o que importa de fato — executa numa
+        thread de REQUISICAO do Flask. Antes rodava numa `threading.Thread` do web
+        worker, que no uWSGI do PythonAnywhere (sem `--enable-threads`) so avanca
+        quando chega outra requisicao: 34% dos prints nunca eram lidos.
+
+        Quem decide se uma mensagem precisa de leitura e o BACKEND, que marca
+        `metadata.needs_image_description` ao enfileirar — a regra de "imagem sem
+        descricao" tem um dono so (`wppmsghelper._is_undescribed_image`).
+
+        Nunca deixa o batch cair: qualquer falha mantem a mensagem original.
+        """
+        pendentes = [
+            index
+            for index, message in enumerate(batch)
+            if (message.metadata or {}).get("needs_image_description")
+        ]
+        if not pendentes:
+            return batch
+
+        lidas = 0
+        for index in pendentes:
+            if lidas >= _MAX_IMAGES_PER_BATCH:
+                self._add_event(
+                    "image_description_skipped",
+                    "teto de imagens por batch",
+                    {"msg_id": batch[index].msg_id},
+                )
+                continue
+            lidas += 1
+            message = batch[index]
+            try:
+                result = await workflow.execute_activity(
+                    describe_whatsapp_image,
+                    WhatsAppImageDescriptionInput(
+                        tenant_id=payload.tenant_id,
+                        conversation_id=payload.conversation_id,
+                        msg_id=message.msg_id,
+                        text=message.text,
+                        jid=message.jid,
+                        jid_alt=message.jid_alt,
+                        metadata=message.metadata,
+                    ),
+                    schedule_to_start_timeout=_DESCRIBE_SCHEDULE_TO_START,
+                    start_to_close_timeout=_DESCRIBE_START_TO_CLOSE,
+                    schedule_to_close_timeout=_DESCRIBE_SCHEDULE_TO_CLOSE,
+                    retry_policy=RetryPolicy(
+                        initial_interval=timedelta(seconds=2),
+                        maximum_interval=timedelta(seconds=20),
+                        maximum_attempts=3,
+                    ),
+                    **activity_kwargs,
+                )
+            except Exception as exc:
+                # Print nao lido NAO pode calar a conversa: segue com o texto cru e o
+                # agente responde com honestidade que nao abriu (a nota multimodal do
+                # prompt cobre esse estado).
+                self._add_event(
+                    "image_description_failed",
+                    str(exc)[:200],
+                    {"msg_id": message.msg_id},
+                )
+                continue
+
+            if result.status == "described" and result.text:
+                batch[index] = replace(message, text=result.text)
+                self._add_event(
+                    "image_described", message.msg_id, {"chars": len(result.description)}
+                )
+            else:
+                self._add_event(
+                    "image_description_empty",
+                    result.reason[:200],
+                    {"msg_id": message.msg_id},
+                )
+        return batch
 
     def _accept_message(self, message: WhatsAppInboundMessage) -> bool:
         """Enfileira uma mensagem NOVA (dedup por msg_id já visto). Retorna se aceitou."""

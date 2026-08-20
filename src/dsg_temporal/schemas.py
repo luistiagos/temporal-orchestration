@@ -158,6 +158,35 @@ class WhatsAppWorkflowInput:
 
 
 @dataclass
+class WhatsAppImageDescriptionInput:
+    """Pedido de leitura de UMA imagem recebida no WhatsApp.
+
+    O trabalho em si roda no backend legado (fonte única da visão:
+    `wpp_vision.describe_whatsapp_image`); esta atividade só existe para que o
+    Temporal seja o dono do agendamento/retry/timeout dessa leitura. Antes ela
+    rodava numa `threading.Thread` do web worker do PythonAnywhere — que sobe SEM
+    `--enable-threads` e por isso congelava a thread entre requisições
+    (docs/bugs/.../2026-08-19-agentes-nao-leem-imagem-do-cliente.md).
+    """
+    tenant_id: str
+    conversation_id: str
+    msg_id: str
+    text: str
+    jid: str
+    jid_alt: str | None = None
+    metadata: Metadata = field(default_factory=dict)
+
+
+@dataclass
+class WhatsAppImageDescriptionResult:
+    status: str
+    text: str = ""
+    description: str = ""
+    reason: str = ""
+    raw: Metadata = field(default_factory=dict)
+
+
+@dataclass
 class WhatsAppBatchInput:
     tenant_id: str
     conversation_id: str

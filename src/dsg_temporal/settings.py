@@ -97,10 +97,15 @@ class Settings:
     legacy_event_callback_path: str
     legacy_event_callback_secret: str
     legacy_whatsapp_process_path: str
+    legacy_whatsapp_describe_image_path: str
     legacy_wpp_sender_snapshot_path: str
     dry_run: bool
     assume_purchased_on_check_error: bool
     http_timeout_seconds: int
+    # Teto HTTP da leitura de imagem. Maior que o http_timeout_seconds geral
+    # porque a midia recem-chegada pode nao estar decifrada na Evolution e o
+    # backend retenta o download (3x8s + 2x1,5s) antes de descrever.
+    describe_image_timeout_seconds: int
     activity_max_workers: int
     # Threads dedicadas às atividades de conversa (pool próprio, separado do
     # remarketing). Conversas são rápidas (um POST ao backend) → pool pequeno basta.
@@ -136,6 +141,10 @@ def get_settings() -> Settings:
             "LEGACY_WHATSAPP_PROCESS_PATH",
             "/temporal/whatsapp/process",
         ),
+        legacy_whatsapp_describe_image_path=_str_env(
+            "LEGACY_WHATSAPP_DESCRIBE_IMAGE_PATH",
+            "/temporal/whatsapp/describe-image",
+        ),
         # Endpoint do backend que o worker consulta a cada dispatch de WhatsApp
         # para obter min/max intervalo, cap diário, modo teste e estatísticas.
         # Autenticado pelo mesmo segredo do callback (LEGACY_EVENT_CALLBACK_SECRET).
@@ -149,6 +158,7 @@ def get_settings() -> Settings:
             True,
         ),
         http_timeout_seconds=_int_env("HTTP_TIMEOUT_SECONDS", 20),
+        describe_image_timeout_seconds=_int_env("DESCRIBE_IMAGE_TIMEOUT_SECONDS", 45),
         activity_max_workers=_int_env("ACTIVITY_MAX_WORKERS", 20),
         wpp_activity_max_workers=_int_env("WPP_ACTIVITY_MAX_WORKERS", 10),
         # Throttle global apenas para EMAIL — WhatsApp tem pacing por config
