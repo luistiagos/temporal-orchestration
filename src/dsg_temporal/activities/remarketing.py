@@ -200,12 +200,17 @@ def _whatsapp_floor_wait(snapshot: dict) -> float:
     return (min_iv - elapsed) + random.uniform(1.0, 30.0)
 
 
-def _apply_whatsapp_pacing(snapshot: dict) -> float:
+def _apply_whatsapp_pacing(snapshot: dict, idempotency_key: str | None = None) -> float:
     """Aplica o pacing aleatório (min..max) entre dois envios WhatsApp no
-    mesmo worker, usando o lock global do canal. Retorna os segundos de wait."""
+    mesmo worker, usando o lock global do canal. Retorna os segundos de wait.
+
+    Protege contra runaway de backlog: o teto máximo de reserva na fila é
+    limitado a no máximo 2.5 * max_interval_seconds para evitar filas de horas
+    induzidas por retentativas."""
     min_iv = max(1, int(snapshot.get("min_interval_seconds", 90)))
     max_iv = max(min_iv, int(snapshot.get("max_interval_seconds", 300)))
     target = random.uniform(min_iv, max_iv)
+    max_queue_horizon = max_iv * 2.5
     lock = _dispatch_locks["whatsapp"]
 
     # Worker recém-(re)iniciado: a memória do processo zera, mas o DB sabe
@@ -214,24 +219,41 @@ def _apply_whatsapp_pacing(snapshot: dict) -> float:
     elapsed_db = _elapsed_since_last_db_send(snapshot)
 
     wait = 0.0
-    elapsed: float | None = None
     with lock:
         now = time.monotonic()
         last = _dispatch_last_sent_at["whatsapp"]
-        if last > 0:
-            elapsed = now - last
-        elif elapsed_db is not None:
-            elapsed = elapsed_db
-        if elapsed is not None and elapsed < target:
-            wait = target - elapsed
+        if last > now:
+            # last está no futuro (outros pedidos estão aguardando na fila)
+            queue_depth = last - now
+            if queue_depth > max_queue_horizon:
+                logger.warning(
+                    "whatsapp pacing queue hit ceiling (depth=%.1fs, max=%.1fs, key=%s) — capping reservation",
+                    queue_depth, max_queue_horizon, idempotency_key or "unknown",
+                )
+                last = now + max_queue_horizon
+            wait = (last - now) + target
             _dispatch_last_sent_at["whatsapp"] = now + wait
+            reserva_em = last - now
         else:
-            _dispatch_last_sent_at["whatsapp"] = now
+            if last > 0:
+                elapsed = now - last
+            elif elapsed_db is not None:
+                elapsed = elapsed_db
+            else:
+                elapsed = None
+
+            if elapsed is not None and elapsed < target:
+                wait = target - elapsed
+                _dispatch_last_sent_at["whatsapp"] = now + wait
+            else:
+                wait = 0.0
+                _dispatch_last_sent_at["whatsapp"] = now
+            reserva_em = 0.0
 
     if wait > 0:
         logger.info(
-            "whatsapp pacing required: wait %.1fs (target=%.1fs, elapsed=%.1fs, range=%d..%d)",
-            wait, target, elapsed, min_iv, max_iv,
+            "whatsapp pacing required: wait %.1fs (target=%.1fs, backlog=%.1fs, range=%d..%d, key=%s)",
+            wait, target, reserva_em, min_iv, max_iv, idempotency_key or "unknown",
         )
     return wait
 
@@ -298,7 +320,7 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
 
         # Aplica o pacing aleatório min..max (lock global do worker).
         if not payload.bypass_pacing:
-            wait = _apply_whatsapp_pacing(snapshot)
+            wait = _apply_whatsapp_pacing(snapshot, payload.idempotency_key)
             if wait > 0:
                 return DispatchResult(
                     status="pacing_required",
@@ -413,6 +435,9 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
                 or raw.get("outbox_id")
             )
         status = "sent"  # WhatsApp já é "sent" — o envio é síncrono ao Evolution API
+        if channel == "whatsapp":
+            with _dispatch_locks["whatsapp"]:
+                _dispatch_last_sent_at["whatsapp"] = max(_dispatch_last_sent_at["whatsapp"], time.monotonic())
         return DispatchResult(status=status, provider_message_id=provider_id, raw=raw if isinstance(raw, dict) else {})
 
     retryable = response.status_code >= 500 or response.status_code == 429

@@ -327,6 +327,24 @@ class TestWhatsAppPacingFloor:
         })
         assert wait == 0.0
 
+    def test_pacing_queue_reserva_cumulativa_com_teto(self):
+        # 10 chamadas consecutivas de pacing não podem explodir para 2 horas;
+        # o teto limita o horizonte a max_interval_seconds * 2.5 + max_interval
+        snapshot = {
+            "min_interval_seconds": 100,
+            "max_interval_seconds": 100,
+            "last_sent_at_iso": datetime.now(timezone.utc).isoformat(),
+        }
+        waits = []
+        for i in range(10):
+            w = _apply_whatsapp_pacing(snapshot, f"key-{i}")
+            waits.append(w)
+
+        # O primeiro espera ~100s
+        assert 95 <= waits[0] <= 105
+        # O último deve ser limitado pelo teto (100 * 2.5 + 100 = 350s), longe de 1000s+
+        assert waits[-1] <= 360
+
 
 # ===========================================================================
 # notify_remarketing_event  (CB-10 — serialização)
