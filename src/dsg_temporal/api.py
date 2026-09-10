@@ -408,3 +408,37 @@ async def cancel_whatsapp_workflow(
     handle = temporal_client(request).get_workflow_handle(workflow_id)
     await handle.signal(WhatsAppConversationWorkflow.cancel, payload.reason)
     return {"workflow_id": workflow_id, "status": "cancel_requested"}
+
+
+# --- Sonda de workflow preso -------------------------------------------------
+# Rotas AGNOSTICAS de canal (`/v1/workflows/...`): os workflows presos em retry
+# infinito de workflow task incluem remarketing E whatsapp, e nenhuma das rotas
+# por canal responde a pergunta "este workflow ainda anda?". Ver
+# `dsg_temporal/diagnose.py` para o porque a mensagem do erro so existe no
+# historico.
+
+
+@app.get("/v1/workflows/{workflow_id}/diagnose")
+async def diagnose_workflow_route(
+    workflow_id: str,
+    request: Request,
+    with_failures: bool | None = None,
+    failure_limit: int = 5,
+) -> Any:
+    """Veredicto de UM workflow: `running`, `closed`, `not_found` ou
+    `stuck_task_failure` (RUNNING para o Temporal, morto na pratica). Quando
+    preso, traz a mensagem e o `cause` do `WorkflowTaskFailed` — a unica forma
+    de distinguir non-determinismo de excecao nao tratada no workflow."""
+    from dsg_temporal.diagnose import diagnose_workflow
+
+    try:
+        return await diagnose_workflow(
+            temporal_client(request),
+            workflow_id,
+            with_failures=with_failures,
+            failure_limit=max(1, min(failure_limit, 20)),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"{type(exc).__name__}: {exc}") from exc
