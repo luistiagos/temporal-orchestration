@@ -112,6 +112,10 @@ class Settings:
     wpp_activity_max_workers: int
     email_min_interval_seconds: int
     remarketing_email_override_to: str
+    # Segredo das rotas DESTRUTIVAS (`/v1/workflows/{id}/terminate`). Vazio =>
+    # rota aberta, como o resto desta API (o backend a chama sem credencial).
+    # Definir no Railway liga o portao sem trocar codigo.
+    admin_token: str
 
 
 @lru_cache(maxsize=1)
@@ -168,4 +172,5 @@ def get_settings() -> Settings:
         # redirecionado para este endereço. WhatsApp tem seu próprio modo teste
         # configurado pelo admin (WhatsAppSenderConfig.test_phone).
         remarketing_email_override_to=_str_env("REMARKETING_EMAIL_OVERRIDE_TO", ""),
+        admin_token=_str_env("ADMIN_TOKEN", ""),
     )

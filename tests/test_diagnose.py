@@ -29,6 +29,7 @@ from dsg_temporal.diagnose import (
     VERDICT_STUCK,
     diagnose_workflow,
     summarize_task_failures,
+    terminate_workflow,
     verdict_for,
 )
 
@@ -214,5 +215,23 @@ def test_workflow_task_em_retry_traz_veredicto_preso_e_a_mensagem():
                 assert failure["cause"] == (
                     "WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_WORKER_UNHANDLED_FAILURE"
                 )
+
+                # Terminar e' a unica saida: signal nao chega em quem nao
+                # processa workflow task.
+                killed = await terminate_workflow(env.client, handle.id, "teste")
+                assert killed["status"] == "terminated"
+                after = await diagnose_workflow(env.client, handle.id)
+                assert after["verdict"] == VERDICT_CLOSED
+                assert after["status_name"] == "TERMINATED"
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.integration
+def test_terminate_de_workflow_inexistente_nao_estoura():
+    async def run_test() -> None:
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            out = await terminate_workflow(env.client, f"nada-{uuid.uuid4().hex}", "teste")
+            assert out["status"] == "not_found"
 
     asyncio.run(run_test())

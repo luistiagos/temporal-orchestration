@@ -213,3 +213,19 @@ async def diagnose_workflow(
     result["history_scanned"] = len(events)
     result["history_truncated"] = truncated
     return result
+
+
+async def terminate_workflow(client: Client, workflow_id: str, reason: str) -> dict[str, Any]:
+    """Termina o workflow. E' o unico jeito de libertar o `workflow_id` de um
+    workflow PRESO: `cancel` e `pause` sao SIGNAL, e signal depende do workflow
+    task rodar — justamente o que esta falhando. `reset` tambem nao serve:
+    replay do mesmo historico com o mesmo codigo quebra no mesmo ponto.
+    """
+    handle = client.get_workflow_handle(workflow_id)
+    try:
+        await handle.terminate(reason=reason)
+    except Exception as exc:
+        if is_not_found(exc):
+            return {"workflow_id": workflow_id, "status": "not_found", "detail": str(exc)[:300]}
+        raise
+    return {"workflow_id": workflow_id, "status": "terminated", "reason": reason}

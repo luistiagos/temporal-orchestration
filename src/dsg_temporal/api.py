@@ -418,6 +418,22 @@ async def cancel_whatsapp_workflow(
 # historico.
 
 
+class TerminatePayload(BaseModel):
+    reason: str = ""
+
+
+def _require_admin(request: Request) -> None:
+    """Portao das acoes destrutivas. Se `ADMIN_TOKEN` estiver definido no
+    ambiente, exige o header `X-Admin-Token`; sem a variavel definida a rota
+    fica aberta como o resto desta API (que o backend chama sem credencial)."""
+    settings = get_settings()
+    expected = settings.admin_token
+    if not expected:
+        return
+    if request.headers.get("X-Admin-Token", "") != expected:
+        raise HTTPException(status_code=403, detail="invalid admin token")
+
+
 @app.get("/v1/workflows/{workflow_id}/diagnose")
 async def diagnose_workflow_route(
     workflow_id: str,
@@ -438,6 +454,26 @@ async def diagnose_workflow_route(
             with_failures=with_failures,
             failure_limit=max(1, min(failure_limit, 20)),
         )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"{type(exc).__name__}: {exc}") from exc
+
+
+@app.post("/v1/workflows/{workflow_id}/terminate")
+async def terminate_workflow_route(
+    workflow_id: str,
+    payload: TerminatePayload,
+    request: Request,
+) -> Any:
+    """Termina o workflow. Unica saida para um workflow preso: `cancel` e
+    `pause` sao signal, e signal depende do workflow task que esta falhando."""
+    from dsg_temporal.diagnose import terminate_workflow
+
+    _require_admin(request)
+    reason = (payload.reason or "").strip() or "terminated via /v1/workflows/terminate"
+    try:
+        return await terminate_workflow(temporal_client(request), workflow_id, reason)
     except HTTPException:
         raise
     except Exception as exc:
