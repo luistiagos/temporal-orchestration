@@ -119,6 +119,44 @@ class TestCheckPurchase:
         assert check_purchase(_purchase_input()).purchased is True
 
     @responses.activate
+    def test_contrato_t2_le_purchased_e_checkout_pending(self, settings_env):
+        """Resposta do backend desde o T2: dict com purchased + segundos do PIX
+        aberto (docs/modules/remarketing/bugs/2026-11-06-abandono-...)."""
+        responses.add(responses.GET, f"{BASE}/user_has_purchase",
+                      json={"purchased": False, "checkout_pending_seconds": 1200},
+                      status=200)
+        result = check_purchase(_purchase_input())
+        assert result.purchased is False
+        assert result.checkout_pending_seconds == 1200
+
+    @responses.activate
+    def test_contrato_t2_comprou_sem_checkout(self, settings_env):
+        responses.add(responses.GET, f"{BASE}/user_has_purchase",
+                      json={"purchased": True, "checkout_pending_seconds": 0},
+                      status=200)
+        result = check_purchase(_purchase_input())
+        assert result.purchased is True
+        assert result.checkout_pending_seconds == 0
+
+    @pytest.mark.parametrize("body", [
+        True,                                          # bool cru (backend antigo)
+        {"purchased": False},                          # sem o campo
+        {"purchased": False, "checkout_pending_seconds": "x"},
+        {"purchased": False, "checkout_pending_seconds": None},
+        {"purchased": False, "checkout_pending_seconds": -30},
+    ])
+    @responses.activate
+    def test_checkout_pending_ausente_ou_invalido_vira_zero(self, settings_env, body):
+        responses.add(responses.GET, f"{BASE}/user_has_purchase", json=body, status=200)
+        assert check_purchase(_purchase_input()).checkout_pending_seconds == 0
+
+    def test_dry_run_checkout_pending_zero(self, monkeypatch):
+        monkeypatch.setenv("DRY_RUN", "true")
+        monkeypatch.setenv("LEGACY_BACKEND_BASE_URL", BASE)
+        get_settings.cache_clear()
+        assert check_purchase(_purchase_input()).checkout_pending_seconds == 0
+
+    @responses.activate
     @pytest.mark.parametrize("status", [500, 502, 503, 504, 429])
     def test_http_5xx_e_429_levantam_erro(self, settings_env, status):
         responses.add(responses.GET, f"{BASE}/user_has_purchase",

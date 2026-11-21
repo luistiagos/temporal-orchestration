@@ -21,6 +21,20 @@ WHATSAPP_WINDOW_END_HOUR = 20  # 20:00 = limite superior (não envia >= 20:00)
 # fila em prod (min..max 400..800s) o lead pode comprar enquanto espera.
 PACING_RECHECK_PURCHASE_SECONDS = 600
 
+# Checkout em andamento (PIX gerado e não pago, ver /user_has_purchase):
+# o step de WhatsApp é ADIADO até a janela do PIX fechar, não pulado.
+# docs/modules/remarketing/bugs/2026-11-06-abandono-whatsapp-de-1-minuto-dispara-com-o-cliente-no-checkout-e-em-conversa-com-o-agente.md
+CHECKOUT_PENDING_PATCH = "checkout-pending-wait"
+CHECKOUT_PENDING_REASON = "checkout_in_progress"  # reason do dispatch (backend)
+CHECKOUT_PENDING_STATUS = "checkout_pending"  # DispatchResult interno do workflow
+# Teto de adiamentos por step: quem regera PIX sem parar não segura o step
+# para sempre (~3 h com a janela de 30 min do backend).
+CHECKOUT_PENDING_MAX_ROUNDS = 6
+# Folga sobre o tempo devolvido pelo backend: quem escreve a janela é o
+# relógio dele, não o do workflow.
+CHECKOUT_PENDING_MARGIN_SECONDS = 15
+CHECKOUT_PENDING_MAX_WAIT_SECONDS = 3600
+
 
 def _normalize_window(start_hour: int | None, end_hour: int | None) -> tuple[int, int]:
     """Normaliza (start, end) em horas inteiras BRT. start 0–23, end 1–24, e
@@ -84,6 +98,13 @@ def _whatsapp_resume_after_cap(
         now_utc = now_utc.replace(tzinfo=timezone.utc)
     cap_reset_at = now_utc + timedelta(seconds=max(0.0, cap_reset_seconds))
     return _whatsapp_next_allowed(cap_reset_at, start_hour, end_hour)
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 from dsg_temporal.ids import remarketing_idempotency_key
@@ -184,49 +205,88 @@ class LeadRemarketingWorkflow:
                 if await self._stop_if_requested():
                     return self._state
 
-                try:
-                    purchase = await self._run_purchase_check()
-                except Exception as exc:
-                    # Todas as retentativas esgotadas. NÃO assumimos compra —
-                    # o status fica 'error' para tornar a falha visível e
-                    # diferenciá-la de 'purchased'. O planner pode recriar o
-                    # workflow em uma próxima execução.
-                    self._state.status = "error"
-                    self._state.last_error = f"purchase_check failed: {str(exc)[:300]}"
-                    self._add_event("purchase_check_failed", self._state.last_error)
-                    await self._notify_last_event()
-                    return self._state
-
-                if purchase.purchased:
-                    self._state.status = "purchased"
-                    self._add_event("workflow_stopped", purchase.reason or "Lead purchased")
-                    await self._notify_last_event()
-                    return self._state
-
-                # Janela de envio (TODOS os canais): se o horário atual cai fora
-                # da janela da campanha (default 09:00–20:00 BRT), adia o
-                # despacho para o próximo início de janela.
-                now_utc = workflow.now()
-                allowed_at = _whatsapp_next_allowed(
-                    now_utc, payload.window_start_hour, payload.window_end_hour
-                )
-                if allowed_at > now_utc:
-                    wait_seconds = (allowed_at - now_utc).total_seconds()
-                    self._state.status = "waiting_window"
-                    self._add_event(
-                        "send_window_wait",
-                        f"Postponed {int(wait_seconds // 60)} min until send window",
-                        {
-                            "allowed_at_iso": allowed_at.isoformat(),
-                            "channel": (step.channel or "").strip().lower(),
-                        },
-                    )
-                    await self._notify_last_event()
-                    await self._wait_until_ready(allowed_at)
-                    if await self._stop_if_requested():
+                is_whatsapp = (step.channel or "").strip().lower() == "whatsapp"
+                checkout_rounds = 0
+                while True:
+                    try:
+                        purchase = await self._run_purchase_check()
+                    except Exception as exc:
+                        # Todas as retentativas esgotadas. NÃO assumimos compra —
+                        # o status fica 'error' para tornar a falha visível e
+                        # diferenciá-la de 'purchased'. O planner pode recriar o
+                        # workflow em uma próxima execução.
+                        self._state.status = "error"
+                        self._state.last_error = f"purchase_check failed: {str(exc)[:300]}"
+                        self._add_event("purchase_check_failed", self._state.last_error)
+                        await self._notify_last_event()
                         return self._state
 
-                dispatch_result = await self._dispatch_with_manual_unknown_gate(step, cycle)
+                    if purchase.purchased:
+                        self._state.status = "purchased"
+                        self._add_event("workflow_stopped", purchase.reason or "Lead purchased")
+                        await self._notify_last_event()
+                        return self._state
+
+                    # PIX gerado e não pago: o cliente está no checkout. Adia o
+                    # WhatsApp até a janela do PIX fechar e re-checa a compra.
+                    # Lê o CAMPO (não o raw): histórico anterior ao patch não o
+                    # tem, então o replay dele nunca entra aqui.
+                    if (
+                        is_whatsapp
+                        and purchase.checkout_pending_seconds > 0
+                        and checkout_rounds < CHECKOUT_PENDING_MAX_ROUNDS
+                        and workflow.patched(CHECKOUT_PENDING_PATCH)
+                    ):
+                        checkout_rounds += 1
+                        await self._wait_checkout_pending(
+                            step, cycle, purchase.checkout_pending_seconds,
+                            checkout_rounds, "purchase_check",
+                        )
+                        if await self._stop_if_requested():
+                            return self._state
+                        continue
+
+                    # Janela de envio (TODOS os canais): se o horário atual cai fora
+                    # da janela da campanha (default 09:00–20:00 BRT), adia o
+                    # despacho para o próximo início de janela.
+                    now_utc = workflow.now()
+                    allowed_at = _whatsapp_next_allowed(
+                        now_utc, payload.window_start_hour, payload.window_end_hour
+                    )
+                    if allowed_at > now_utc:
+                        wait_seconds = (allowed_at - now_utc).total_seconds()
+                        self._state.status = "waiting_window"
+                        self._add_event(
+                            "send_window_wait",
+                            f"Postponed {int(wait_seconds // 60)} min until send window",
+                            {
+                                "allowed_at_iso": allowed_at.isoformat(),
+                                "channel": (step.channel or "").strip().lower(),
+                            },
+                        )
+                        await self._notify_last_event()
+                        await self._wait_until_ready(allowed_at)
+                        if await self._stop_if_requested():
+                            return self._state
+
+                    dispatch_result = await self._dispatch_with_manual_unknown_gate(step, cycle)
+                    # O backend viu o PIX aberto no portão da rota (abriu
+                    # depois do check, ou durante a fila de pacing): mesmo
+                    # adiamento, mesma contagem de voltas.
+                    if (
+                        dispatch_result.status == CHECKOUT_PENDING_STATUS
+                        and checkout_rounds < CHECKOUT_PENDING_MAX_ROUNDS
+                    ):
+                        checkout_rounds += 1
+                        await self._wait_checkout_pending(
+                            step, cycle, _int_or_zero((dispatch_result.raw or {}).get("defer_seconds")),
+                            checkout_rounds, "dispatch",
+                        )
+                        if await self._stop_if_requested():
+                            return self._state
+                        continue
+                    break
+
                 if dispatch_result.status in {"sent", "queued", "skipped"}:
                     sent_at = workflow.now()
                     idem_key = remarketing_idempotency_key(
@@ -516,6 +576,22 @@ class LeadRemarketingWorkflow:
                 bypass_pacing = False
                 continue
 
+            # PIX aberto visto pelo backend: não é falha, é adiamento. Sai na
+            # hora (sem as 3 tentativas de 5/10 s, que esgotavam e pulavam o
+            # step) e o run espera a janela do PIX e re-checa a compra.
+            if (
+                channel == "whatsapp"
+                and result.status == "failed"
+                and result.reason == CHECKOUT_PENDING_REASON
+                and workflow.patched(CHECKOUT_PENDING_PATCH)
+            ):
+                return DispatchResult(
+                    status=CHECKOUT_PENDING_STATUS,
+                    retryable=False,
+                    reason=CHECKOUT_PENDING_REASON,
+                    raw=result.raw,
+                )
+
             if result.status != "unknown":
                 if result.status == "failed" and result.retryable and attempts < max_attempts:
                     wait_s = retry_waits_seconds[attempts - 1]
@@ -553,6 +629,35 @@ class LeadRemarketingWorkflow:
             if self._retry_current_step:
                 self._retry_current_step = False
                 continue
+
+    async def _wait_checkout_pending(
+        self, step, cycle: int, pending_seconds: int, round_n: int, source: str
+    ) -> None:
+        """Espera a janela do PIX aberto fechar (mais a folga), respeitando
+        pause/cancel/purchase_confirmed. Status 'waiting': já está no conjunto
+        de status ATIVOS do planner (`manageleads_temporal.active_tracking_sql`)
+        — um status novo faria o planner ver o workflow como encerrado."""
+        wait_s = min(
+            max(0, int(pending_seconds)) + CHECKOUT_PENDING_MARGIN_SECONDS,
+            CHECKOUT_PENDING_MAX_WAIT_SECONDS,
+        )
+        resume_at = workflow.now() + timedelta(seconds=wait_s)
+        self._state.status = "waiting"
+        self._add_event(
+            "checkout_pending_wait",
+            f"Checkout in progress (PIX pending) — postponed {wait_s}s "
+            f"({round_n}/{CHECKOUT_PENDING_MAX_ROUNDS})",
+            {
+                "step_id": step.step_id,
+                "cycle": cycle,
+                "wait_seconds": wait_s,
+                "round": round_n,
+                "source": source,
+                "resume_at_iso": resume_at.isoformat(),
+            },
+        )
+        await self._notify_last_event()
+        await self._wait_until_ready(resume_at)
 
     async def _wait_until_ready(self, due_at) -> None:
         while True:

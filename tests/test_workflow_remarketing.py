@@ -561,3 +561,230 @@ def test_pacing_required_repetido_no_bypass_re_dorme():
     assert calls == [False, True, True]
     event_types = [e.event_type for e in result.events]
     assert event_types.count("whatsapp_pacing_wait") == 2
+
+
+# ---------------------------------------------------------------------------
+# Checkout em andamento: PIX gerado e não pago adia o WhatsApp (T3 de
+# docs/modules/remarketing/bugs/2026-11-06-abandono-whatsapp-de-1-minuto-dispara-com-o-cliente-no-checkout-e-em-conversa-com-o-agente.md)
+# ---------------------------------------------------------------------------
+
+from pathlib import Path
+
+from temporalio.client import WorkflowHistory
+from temporalio.worker import Replayer
+
+from dsg_temporal.workflows.remarketing import (
+    CHECKOUT_PENDING_MARGIN_SECONDS,
+    CHECKOUT_PENDING_MAX_ROUNDS,
+)
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _make_check_sequence(results):
+    """results: lista de (purchased, checkout_pending_seconds); o último repete."""
+    calls = {"n": 0}
+
+    @activity.defn(name="check_purchase")
+    def _check(payload: PurchaseCheckInput) -> PurchaseCheckResult:
+        idx = min(calls["n"], len(results) - 1)
+        calls["n"] += 1
+        purchased, pending = results[idx]
+        return PurchaseCheckResult(purchased=purchased, checkout_pending_seconds=pending)
+
+    _check.calls = calls  # type: ignore[attr-defined]
+    return _check
+
+
+def _checkout_in_progress(defer_seconds=600):
+    # Forma exata que a activity devolve para o {"ok": false, ...} do backend (T2).
+    return DispatchResult(
+        status="failed", retryable=True, reason="checkout_in_progress",
+        raw={"ok": False, "retryable": True, "reason": "checkout_in_progress",
+             "defer_seconds": defer_seconds, "sent": False},
+    )
+
+
+def _always_open():
+    return dict(window_start_hour=0, window_end_hour=24)
+
+
+def _waits(result):
+    return [e for e in result.events if e.event_type == "checkout_pending_wait"]
+
+
+def test_pix_aberto_espera_e_comprou_encerra_sem_dispatch():
+    check = _make_check_sequence([(False, 900), (True, 0)])
+    dispatch = _make_dispatch([DispatchResult(status="sent")])
+
+    result = asyncio.run(_run(_input([_whatsapp_step()], **_always_open()), check, dispatch))
+
+    assert result.status == "purchased"
+    assert dispatch.calls["n"] == 0
+    assert check.calls["n"] == 2
+    waits = _waits(result)
+    assert len(waits) == 1
+    assert waits[0].metadata["wait_seconds"] == 900 + CHECKOUT_PENDING_MARGIN_SECONDS
+    assert waits[0].metadata["source"] == "purchase_check"
+
+
+def test_pix_aberto_espera_e_nao_pagou_envia_uma_vez():
+    check = _make_check_sequence([(False, 900), (False, 0)])
+    dispatch = _make_dispatch([DispatchResult(status="sent")])
+
+    result = asyncio.run(_run(_input([_whatsapp_step()], **_always_open()), check, dispatch))
+
+    assert result.status == "completed"
+    assert dispatch.calls["n"] == 1
+    assert [(s.step_id, s.status) for s in result.sent_steps] == [("wpp-1", "sent")]
+    assert len(_waits(result)) == 1
+
+
+def test_dispatch_checkout_in_progress_adia_em_vez_de_pular():
+    """Antes do T3: 3 tentativas de 5/10 s e o step era pulado. Agora: espera
+    o defer_seconds, re-checa a compra e envia (1 dispatch extra, não 3)."""
+    check = _make_check_sequence([(False, 0)])
+    dispatch = _make_dispatch([_checkout_in_progress(600), DispatchResult(status="sent")])
+
+    result = asyncio.run(_run(_input([_whatsapp_step()], **_always_open()), check, dispatch))
+
+    assert result.status == "completed"
+    assert dispatch.calls["n"] == 2
+    assert check.calls["n"] == 2  # re-check depois da espera
+    assert [(s.step_id, s.status) for s in result.sent_steps] == [("wpp-1", "sent")]
+    waits = _waits(result)
+    assert len(waits) == 1
+    assert waits[0].metadata["source"] == "dispatch"
+    assert waits[0].metadata["wait_seconds"] == 600 + CHECKOUT_PENDING_MARGIN_SECONDS
+    assert not [e for e in result.events if e.event_type == "step_retry"]
+
+
+def test_dispatch_checkout_in_progress_e_depois_comprou():
+    check = _make_check_sequence([(False, 0), (True, 0)])
+    dispatch = _make_dispatch([_checkout_in_progress(600), DispatchResult(status="sent")])
+
+    result = asyncio.run(_run(_input([_whatsapp_step()], **_always_open()), check, dispatch))
+
+    assert result.status == "purchased"
+    assert dispatch.calls["n"] == 1
+    assert result.sent_steps == []
+
+
+def test_teto_de_adiamentos_pula_o_step_e_segue():
+    """PIX regerado sem parar: no máximo CHECKOUT_PENDING_MAX_ROUNDS esperas;
+    depois o step vai ao dispatch e, com o backend ainda vendo PIX aberto, o
+    step de WhatsApp é pulado (o workflow continua)."""
+    check = _make_check_sequence([(False, 900)])
+    dispatch = _make_dispatch([_checkout_in_progress(900)])
+
+    result = asyncio.run(_run(
+        _input([_whatsapp_step()], **_always_open()), check, dispatch, timeout_days=5,
+    ))
+
+    assert result.status == "completed"
+    assert result.sent_steps == []
+    assert len(_waits(result)) == CHECKOUT_PENDING_MAX_ROUNDS
+    assert check.calls["n"] == CHECKOUT_PENDING_MAX_ROUNDS + 1
+    assert dispatch.calls["n"] == 1  # teto esgotado: sem 3 retentativas
+    assert result.last_error == "checkout_in_progress"
+
+
+def test_espera_unica_limitada_a_uma_hora():
+    check = _make_check_sequence([(False, 10 * 3600), (False, 0)])
+    dispatch = _make_dispatch([DispatchResult(status="sent")])
+
+    result = asyncio.run(_run(_input([_whatsapp_step()], **_always_open()), check, dispatch))
+
+    assert _waits(result)[0].metadata["wait_seconds"] == 3600
+    assert result.status == "completed"
+
+
+def test_email_nao_adia_com_pix_aberto():
+    check = _make_check_sequence([(False, 900)])
+    dispatch = _make_dispatch([DispatchResult(status="sent")])
+
+    result = asyncio.run(_run(_input([_email_step()], **_always_open()), check, dispatch))
+
+    assert result.status == "completed"
+    assert check.calls["n"] == 1
+    assert dispatch.calls["n"] == 1
+    assert _waits(result) == []
+
+
+def test_status_durante_a_espera_e_ativo_para_o_planner():
+    """O status gravado no backend durante a espera precisa estar no conjunto
+    de ativos de manageleads_temporal.active_tracking_sql, senão o planner
+    recria o workflow."""
+    seen = []
+
+    @activity.defn(name="notify_remarketing_event")
+    def _notify(payload: NotifyRemarketingEventInput) -> None:
+        if payload.event.event_type == "checkout_pending_wait":
+            seen.append(payload.state.status)
+
+    async def run():
+        task_queue = _task_queue()
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                async with Worker(
+                    env.client, task_queue=task_queue,
+                    workflows=[LeadRemarketingWorkflow],
+                    activities=[_make_check_sequence([(False, 900), (False, 0)]),
+                                _make_dispatch([DispatchResult(status="sent")]), _notify],
+                    activity_executor=executor,
+                ):
+                    return await env.client.execute_workflow(
+                        LeadRemarketingWorkflow.run,
+                        _input([_whatsapp_step()], **_always_open()),
+                        id=f"test-{uuid.uuid4().hex}", task_queue=task_queue,
+                        execution_timeout=timedelta(days=2),
+                    )
+
+    asyncio.run(run())
+    assert seen == ["waiting"]
+
+
+def test_replay_de_historico_anterior_ao_t3_e_deterministico():
+    """Workflow em andamento no deploy: o histórico gravado pelo código de
+    ae35d99 (check sem o campo, dispatch checkout_in_progress x3 e step
+    pulado) re-executa com o código novo sem não-determinismo."""
+    history = WorkflowHistory.from_json(
+        "pre-t3",
+        (_FIXTURES / "history_pre_t3_checkout_in_progress.json").read_text(encoding="utf-8"),
+    )
+
+    async def run():
+        await Replayer(workflows=[LeadRemarketingWorkflow]).replay_workflow(history)
+
+    asyncio.run(run())
+
+
+def test_replay_de_historico_novo_com_espera_e_deterministico():
+    async def run():
+        task_queue = _task_queue()
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                async with Worker(
+                    env.client, task_queue=task_queue,
+                    workflows=[LeadRemarketingWorkflow],
+                    activities=[
+                        _make_check_sequence([(False, 900), (False, 0)]),
+                        _make_dispatch([_checkout_in_progress(600), DispatchResult(status="sent")]),
+                        _mock_notify,
+                    ],
+                    activity_executor=executor,
+                ):
+                    handle = await env.client.start_workflow(
+                        LeadRemarketingWorkflow.run,
+                        _input([_whatsapp_step()], **_always_open()),
+                        id=f"test-{uuid.uuid4().hex}", task_queue=task_queue,
+                        execution_timeout=timedelta(days=2),
+                    )
+                    result = await handle.result()
+                    history = await handle.fetch_history()
+        await Replayer(workflows=[LeadRemarketingWorkflow]).replay_workflow(history)
+        return result
+
+    result = asyncio.run(run())
+    assert len(_waits(result)) == 2
+    assert [(s.step_id, s.status) for s in result.sent_steps] == [("wpp-1", "sent")]

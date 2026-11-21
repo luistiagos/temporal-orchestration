@@ -104,7 +104,21 @@ def check_purchase(payload: PurchaseCheckInput) -> PurchaseCheckResult:
         raise RuntimeError(f"purchase check http {response.status_code}: {raw}")
 
     purchased = bool(raw.get("value", raw.get("purchased", raw.get("haspurchase", raw))))
-    return PurchaseCheckResult(purchased=purchased, raw=raw)
+    return PurchaseCheckResult(
+        purchased=purchased,
+        raw=raw,
+        checkout_pending_seconds=_checkout_pending_seconds(raw),
+    )
+
+
+def _checkout_pending_seconds(raw: dict[str, Any]) -> int:
+    """Segundos de checkout em andamento (PIX gerado e não pago) que o backend
+    devolve em /user_has_purchase. Ausente, inválido ou negativo -> 0."""
+    try:
+        value = int(raw.get("checkout_pending_seconds") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, value)
 
 
 # --- Global per-worker rate limit gate for dispatch ---

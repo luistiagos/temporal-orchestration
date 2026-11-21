@@ -61,6 +61,10 @@ class PurchaseCheckResult:
     purchased: bool
     reason: str = ""
     raw: Metadata = field(default_factory=dict)
+    # Segundos até fechar a janela do PIX gerado e não pago (checkout em
+    # andamento); 0 = nada aberto. Default 0: histórico antigo sem o campo
+    # decodifica como "nada aberto" e o replay segue o caminho antigo.
+    checkout_pending_seconds: int = 0
 
 
 @dataclass
