@@ -35,6 +35,18 @@ CHECKOUT_PENDING_MAX_ROUNDS = 6
 CHECKOUT_PENDING_MARGIN_SECONDS = 15
 CHECKOUT_PENDING_MAX_WAIT_SECONDS = 3600
 
+# Cliente em conversa com o agente (última mensagem DO CLIENTE nos últimos
+# N min, ver /user_has_purchase): o step de WhatsApp também é ADIADO, com
+# patch e contador próprios — o histórico gravado entre o deploy deste
+# worker e o do backend tem de dar replay. Decisão do dono (opção B) no doc
+# acima, seção "T4 — decisao do dono e design".
+CONVERSATION_ACTIVE_PATCH = "conversation-active-wait"
+CONVERSATION_ACTIVE_REASON = "customer_in_conversation"  # reason do dispatch (backend)
+CONVERSATION_ACTIVE_STATUS = "conversation_active"  # DispatchResult interno do workflow
+# ~1 h de conversa contínua (6 x (600 s + folga)); esgotado, o step é pulado
+# (o agente já está atendendo) e os seguintes continuam.
+CONVERSATION_ACTIVE_MAX_ROUNDS = 6
+
 
 def _normalize_window(start_hour: int | None, end_hour: int | None) -> tuple[int, int]:
     """Normaliza (start, end) em horas inteiras BRT. start 0–23, end 1–24, e
@@ -207,6 +219,7 @@ class LeadRemarketingWorkflow:
 
                 is_whatsapp = (step.channel or "").strip().lower() == "whatsapp"
                 checkout_rounds = 0
+                conversation_rounds = 0
                 while True:
                     try:
                         purchase = await self._run_purchase_check()
@@ -231,6 +244,14 @@ class LeadRemarketingWorkflow:
                     # WhatsApp até a janela do PIX fechar e re-checa a compra.
                     # Lê o CAMPO (não o raw): histórico anterior ao patch não o
                     # tem, então o replay dele nunca entra aqui.
+                    # Cliente em conversa com o agente: mesmo adiamento, patch e
+                    # contador próprios. Os dois ao mesmo tempo: UMA espera, a
+                    # maior. A ordem das chamadas a `patched` (checkout antes)
+                    # é a do código do T3, e histórico gravado por ele tem
+                    # conversation_active_seconds == 0: o segundo patch nunca é
+                    # consultado no replay dele.
+                    wait_checkout = 0
+                    wait_conversation = 0
                     if (
                         is_whatsapp
                         and purchase.checkout_pending_seconds > 0
@@ -238,9 +259,19 @@ class LeadRemarketingWorkflow:
                         and workflow.patched(CHECKOUT_PENDING_PATCH)
                     ):
                         checkout_rounds += 1
-                        await self._wait_checkout_pending(
-                            step, cycle, purchase.checkout_pending_seconds,
-                            checkout_rounds, "purchase_check",
+                        wait_checkout = purchase.checkout_pending_seconds
+                    if (
+                        is_whatsapp
+                        and purchase.conversation_active_seconds > 0
+                        and conversation_rounds < CONVERSATION_ACTIVE_MAX_ROUNDS
+                        and workflow.patched(CONVERSATION_ACTIVE_PATCH)
+                    ):
+                        conversation_rounds += 1
+                        wait_conversation = purchase.conversation_active_seconds
+                    if wait_checkout or wait_conversation:
+                        await self._wait_deferral(
+                            step, cycle, wait_checkout, wait_conversation,
+                            checkout_rounds, conversation_rounds, "purchase_check",
                         )
                         if await self._stop_if_requested():
                             return self._state
@@ -278,9 +309,25 @@ class LeadRemarketingWorkflow:
                         and checkout_rounds < CHECKOUT_PENDING_MAX_ROUNDS
                     ):
                         checkout_rounds += 1
-                        await self._wait_checkout_pending(
-                            step, cycle, _int_or_zero((dispatch_result.raw or {}).get("defer_seconds")),
-                            checkout_rounds, "dispatch",
+                        await self._wait_deferral(
+                            step, cycle,
+                            _int_or_zero((dispatch_result.raw or {}).get("defer_seconds")), 0,
+                            checkout_rounds, conversation_rounds, "dispatch",
+                        )
+                        if await self._stop_if_requested():
+                            return self._state
+                        continue
+                    # O backend viu o cliente conversando com o agente no
+                    # portão da rota: adia com o contador da conversa.
+                    if (
+                        dispatch_result.status == CONVERSATION_ACTIVE_STATUS
+                        and conversation_rounds < CONVERSATION_ACTIVE_MAX_ROUNDS
+                    ):
+                        conversation_rounds += 1
+                        await self._wait_deferral(
+                            step, cycle,
+                            0, _int_or_zero((dispatch_result.raw or {}).get("defer_seconds")),
+                            checkout_rounds, conversation_rounds, "dispatch",
                         )
                         if await self._stop_if_requested():
                             return self._state
@@ -591,6 +638,19 @@ class LeadRemarketingWorkflow:
                     reason=CHECKOUT_PENDING_REASON,
                     raw=result.raw,
                 )
+            # Cliente em conversa com o agente visto pelo backend: idem.
+            if (
+                channel == "whatsapp"
+                and result.status == "failed"
+                and result.reason == CONVERSATION_ACTIVE_REASON
+                and workflow.patched(CONVERSATION_ACTIVE_PATCH)
+            ):
+                return DispatchResult(
+                    status=CONVERSATION_ACTIVE_STATUS,
+                    retryable=False,
+                    reason=CONVERSATION_ACTIVE_REASON,
+                    raw=result.raw,
+                )
 
             if result.status != "unknown":
                 if result.status == "failed" and result.retryable and attempts < max_attempts:
@@ -630,23 +690,47 @@ class LeadRemarketingWorkflow:
                 self._retry_current_step = False
                 continue
 
-    async def _wait_checkout_pending(
-        self, step, cycle: int, pending_seconds: int, round_n: int, source: str
+    async def _wait_deferral(
+        self,
+        step,
+        cycle: int,
+        checkout_seconds: int,
+        conversation_seconds: int,
+        checkout_round: int,
+        conversation_round: int,
+        source: str,
     ) -> None:
-        """Espera a janela do PIX aberto fechar (mais a folga), respeitando
-        pause/cancel/purchase_confirmed. Status 'waiting': já está no conjunto
-        de status ATIVOS do planner (`manageleads_temporal.active_tracking_sql`)
-        — um status novo faria o planner ver o workflow como encerrado."""
+        """Adia o step: espera a MAIOR das janelas (PIX aberto, cliente em
+        conversa) mais a folga, respeitando pause/cancel/purchase_confirmed.
+        O evento leva o nome do motivo que define a espera (empate: checkout).
+        Status 'waiting': já está no conjunto de status ATIVOS do planner
+        (`manageleads_temporal.active_tracking_sql`) — um status novo faria o
+        planner ver o workflow como encerrado."""
+        checkout_seconds = max(0, int(checkout_seconds))
+        conversation_seconds = max(0, int(conversation_seconds))
         wait_s = min(
-            max(0, int(pending_seconds)) + CHECKOUT_PENDING_MARGIN_SECONDS,
+            max(checkout_seconds, conversation_seconds) + CHECKOUT_PENDING_MARGIN_SECONDS,
             CHECKOUT_PENDING_MAX_WAIT_SECONDS,
         )
         resume_at = workflow.now() + timedelta(seconds=wait_s)
+        if conversation_seconds > checkout_seconds:
+            event_type = "conversation_active_wait"
+            round_n = conversation_round
+            message = (
+                f"Customer talking to the agent — postponed {wait_s}s "
+                f"({round_n}/{CONVERSATION_ACTIVE_MAX_ROUNDS})"
+            )
+        else:
+            event_type = "checkout_pending_wait"
+            round_n = checkout_round
+            message = (
+                f"Checkout in progress (PIX pending) — postponed {wait_s}s "
+                f"({round_n}/{CHECKOUT_PENDING_MAX_ROUNDS})"
+            )
         self._state.status = "waiting"
         self._add_event(
-            "checkout_pending_wait",
-            f"Checkout in progress (PIX pending) — postponed {wait_s}s "
-            f"({round_n}/{CHECKOUT_PENDING_MAX_ROUNDS})",
+            event_type,
+            message,
             {
                 "step_id": step.step_id,
                 "cycle": cycle,
@@ -654,6 +738,8 @@ class LeadRemarketingWorkflow:
                 "round": round_n,
                 "source": source,
                 "resume_at_iso": resume_at.isoformat(),
+                "checkout_pending_seconds": checkout_seconds,
+                "conversation_active_seconds": conversation_seconds,
             },
         )
         await self._notify_last_event()

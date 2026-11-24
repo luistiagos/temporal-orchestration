@@ -788,3 +788,194 @@ def test_replay_de_historico_novo_com_espera_e_deterministico():
     result = asyncio.run(run())
     assert len(_waits(result)) == 2
     assert [(s.step_id, s.status) for s in result.sent_steps] == [("wpp-1", "sent")]
+
+
+# ---------------------------------------------------------------------------
+# T4 — cliente em conversa com o agente adia o step de WhatsApp
+# docs/modules/remarketing/bugs/2026-11-06-abandono-whatsapp-de-1-minuto-dispara-com-o-cliente-no-checkout-e-em-conversa-com-o-agente.md
+# ---------------------------------------------------------------------------
+
+from dsg_temporal.workflows.remarketing import CONVERSATION_ACTIVE_MAX_ROUNDS
+
+
+def _make_check_conversa(results):
+    """results: lista de (purchased, checkout_pending_seconds,
+    conversation_active_seconds); o último repete."""
+    calls = {"n": 0}
+
+    @activity.defn(name="check_purchase")
+    def _check(payload: PurchaseCheckInput) -> PurchaseCheckResult:
+        idx = min(calls["n"], len(results) - 1)
+        calls["n"] += 1
+        purchased, pending, conversa = results[idx]
+        return PurchaseCheckResult(
+            purchased=purchased,
+            checkout_pending_seconds=pending,
+            conversation_active_seconds=conversa,
+        )
+
+    _check.calls = calls  # type: ignore[attr-defined]
+    return _check
+
+
+def _customer_in_conversation(defer_seconds=420):
+    # Forma que a activity devolve para o {"ok": false, ...} do backend (T6).
+    return DispatchResult(
+        status="failed", retryable=True, reason="customer_in_conversation",
+        raw={"ok": False, "retryable": True, "reason": "customer_in_conversation",
+             "defer_seconds": defer_seconds, "sent": False},
+    )
+
+
+def _conversa_waits(result):
+    return [e for e in result.events if e.event_type == "conversation_active_wait"]
+
+
+def test_conversa_ativa_espera_e_envia_uma_vez():
+    check = _make_check_conversa([(False, 0, 420), (False, 0, 0)])
+    dispatch = _make_dispatch([DispatchResult(status="sent")])
+
+    result = asyncio.run(_run(_input([_whatsapp_step()], **_always_open()), check, dispatch))
+
+    assert result.status == "completed"
+    assert check.calls["n"] == 2
+    assert dispatch.calls["n"] == 1
+    assert [(s.step_id, s.status) for s in result.sent_steps] == [("wpp-1", "sent")]
+    waits = _conversa_waits(result)
+    assert len(waits) == 1
+    assert waits[0].metadata["wait_seconds"] == 420 + CHECKOUT_PENDING_MARGIN_SECONDS
+    assert waits[0].metadata["source"] == "purchase_check"
+    assert waits[0].metadata["round"] == 1
+    assert _waits(result) == []
+
+
+def test_conversa_ativa_espera_e_comprou_encerra_sem_dispatch():
+    check = _make_check_conversa([(False, 0, 420), (True, 0, 0)])
+    dispatch = _make_dispatch([DispatchResult(status="sent")])
+
+    result = asyncio.run(_run(_input([_whatsapp_step()], **_always_open()), check, dispatch))
+
+    assert result.status == "purchased"
+    assert dispatch.calls["n"] == 0
+
+
+def test_dispatch_customer_in_conversation_adia_em_vez_de_pular():
+    """Sem o T4, o worker trata o reason como falha retryable: 3 tentativas
+    em 30 s e o step pulado (a opcao C, que o dono recusou)."""
+    check = _make_check_conversa([(False, 0, 0)])
+    dispatch = _make_dispatch([_customer_in_conversation(420), DispatchResult(status="sent")])
+
+    result = asyncio.run(_run(_input([_whatsapp_step()], **_always_open()), check, dispatch))
+
+    assert result.status == "completed"
+    assert dispatch.calls["n"] == 2
+    assert check.calls["n"] == 2
+    assert [(s.step_id, s.status) for s in result.sent_steps] == [("wpp-1", "sent")]
+    waits = _conversa_waits(result)
+    assert len(waits) == 1
+    assert waits[0].metadata["source"] == "dispatch"
+    assert waits[0].metadata["wait_seconds"] == 420 + CHECKOUT_PENDING_MARGIN_SECONDS
+    assert not [e for e in result.events if e.event_type == "step_retry"]
+
+
+def test_teto_de_adiamentos_da_conversa_pula_o_step_e_segue():
+    check = _make_check_conversa([(False, 0, 600)])
+    dispatch = _make_dispatch([_customer_in_conversation(600), DispatchResult(status="sent")])
+    email_depois = RemarketingStep(
+        step_id="email-2", order=3, channel="email",
+        template="remarket/email.html", subject="Volte!", delay_minutes=0,
+    )
+    seq = [_whatsapp_step(), email_depois]  # steps rodam por `order`
+
+    result = asyncio.run(_run(
+        _input(seq, stop_on_step_failure=False, **_always_open()), check, dispatch, timeout_days=5,
+    ))
+
+    assert result.status == "completed"
+    assert len(_conversa_waits(result)) == CONVERSATION_ACTIVE_MAX_ROUNDS
+    # 1 dispatch do WhatsApp (teto esgotado, sem 3 retentativas) + 1 do e-mail
+    assert dispatch.calls["n"] == 2
+    assert [(s.step_id, s.status) for s in result.sent_steps] == [("email-2", "sent")]
+    assert [e.message for e in result.events if e.event_type == "step_failed"] == [
+        "customer_in_conversation"
+    ]
+
+
+def test_checkout_e_conversa_ao_mesmo_tempo_esperam_o_maior():
+    check = _make_check_conversa([(False, 900, 420), (False, 0, 0)])
+    dispatch = _make_dispatch([DispatchResult(status="sent")])
+
+    result = asyncio.run(_run(_input([_whatsapp_step()], **_always_open()), check, dispatch))
+
+    assert result.status == "completed"
+    assert check.calls["n"] == 2  # UMA espera, nao duas
+    waits = _waits(result)
+    assert len(waits) == 1 and _conversa_waits(result) == []
+    assert waits[0].metadata["wait_seconds"] == 900 + CHECKOUT_PENDING_MARGIN_SECONDS
+    assert waits[0].metadata["conversation_active_seconds"] == 420
+
+    check = _make_check_conversa([(False, 300, 600), (False, 0, 0)])
+    result = asyncio.run(_run(_input([_whatsapp_step()], **_always_open()), check,
+                              _make_dispatch([DispatchResult(status="sent")])))
+    waits = _conversa_waits(result)
+    assert len(waits) == 1 and _waits(result) == []
+    assert waits[0].metadata["wait_seconds"] == 600 + CHECKOUT_PENDING_MARGIN_SECONDS
+
+
+def test_email_nao_adia_com_conversa_ativa():
+    check = _make_check_conversa([(False, 0, 600)])
+    dispatch = _make_dispatch([DispatchResult(status="sent")])
+
+    result = asyncio.run(_run(_input([_email_step()], **_always_open()), check, dispatch))
+
+    assert result.status == "completed"
+    assert check.calls["n"] == 1
+    assert dispatch.calls["n"] == 1
+    assert _conversa_waits(result) == []
+
+
+def test_replay_de_historico_do_t3_e_deterministico():
+    """Workflow em andamento no deploy do T4: historico gravado pelo codigo
+    de a89d238 (checkout_pending_wait pelo check e pelo dispatch, com o
+    marcador `checkout-pending-wait`) re-executa sem nao-determinismo."""
+    history = WorkflowHistory.from_json(
+        "t3",
+        (_FIXTURES / "history_t3_checkout_pending_wait.json").read_text(encoding="utf-8"),
+    )
+
+    async def run():
+        await Replayer(workflows=[LeadRemarketingWorkflow]).replay_workflow(history)
+
+    asyncio.run(run())
+
+
+def test_replay_de_historico_novo_com_conversa_e_deterministico():
+    async def run():
+        task_queue = _task_queue()
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                async with Worker(
+                    env.client, task_queue=task_queue,
+                    workflows=[LeadRemarketingWorkflow],
+                    activities=[
+                        _make_check_conversa([(False, 900, 420), (False, 0, 300), (False, 0, 0)]),
+                        _make_dispatch([_customer_in_conversation(200), DispatchResult(status="sent")]),
+                        _mock_notify,
+                    ],
+                    activity_executor=executor,
+                ):
+                    handle = await env.client.start_workflow(
+                        LeadRemarketingWorkflow.run,
+                        _input([_whatsapp_step()], **_always_open()),
+                        id=f"test-{uuid.uuid4().hex}", task_queue=task_queue,
+                        execution_timeout=timedelta(days=2),
+                    )
+                    result = await handle.result()
+                    history = await handle.fetch_history()
+        await Replayer(workflows=[LeadRemarketingWorkflow]).replay_workflow(history)
+        return result
+
+    result = asyncio.run(run())
+    assert len(_waits(result)) == 1
+    assert len(_conversa_waits(result)) == 2
+    assert [(s.step_id, s.status) for s in result.sent_steps] == [("wpp-1", "sent")]

@@ -65,6 +65,10 @@ class PurchaseCheckResult:
     # andamento); 0 = nada aberto. Default 0: histórico antigo sem o campo
     # decodifica como "nada aberto" e o replay segue o caminho antigo.
     checkout_pending_seconds: int = 0
+    # Segundos até fechar a janela de "cliente em conversa com o agente"
+    # (última mensagem DO CLIENTE nos últimos N min); 0 = não está conversando.
+    # Mesmo default pelo mesmo motivo (replay de histórico sem o campo).
+    conversation_active_seconds: int = 0
 
 
 @dataclass

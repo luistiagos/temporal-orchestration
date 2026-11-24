@@ -107,16 +107,19 @@ def check_purchase(payload: PurchaseCheckInput) -> PurchaseCheckResult:
     return PurchaseCheckResult(
         purchased=purchased,
         raw=raw,
-        checkout_pending_seconds=_checkout_pending_seconds(raw),
+        checkout_pending_seconds=_nonneg_seconds(raw, "checkout_pending_seconds"),
+        conversation_active_seconds=_nonneg_seconds(raw, "conversation_active_seconds"),
     )
 
 
-def _checkout_pending_seconds(raw: dict[str, Any]) -> int:
-    """Segundos de checkout em andamento (PIX gerado e não pago) que o backend
-    devolve em /user_has_purchase. Ausente, inválido ou negativo -> 0."""
+def _nonneg_seconds(raw: dict[str, Any], key: str) -> int:
+    """Segundos de adiamento que o backend devolve em /user_has_purchase:
+    `checkout_pending_seconds` (PIX gerado e não pago) e
+    `conversation_active_seconds` (cliente falando com o agente).
+    Ausente, inválido ou negativo -> 0."""
     try:
-        value = int(raw.get("checkout_pending_seconds") or 0)
-    except (TypeError, ValueError):
+        value = int(raw.get(key) or 0)
+    except (TypeError, ValueError, AttributeError):
         return 0
     return max(0, value)
 

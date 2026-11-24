@@ -150,6 +150,31 @@ class TestCheckPurchase:
         responses.add(responses.GET, f"{BASE}/user_has_purchase", json=body, status=200)
         assert check_purchase(_purchase_input()).checkout_pending_seconds == 0
 
+    @responses.activate
+    def test_contrato_t6_le_conversation_active_seconds(self, settings_env):
+        """Resposta do backend desde o T6: cliente em conversa com o agente
+        (docs/modules/remarketing/bugs/2026-11-06-abandono-...)."""
+        responses.add(responses.GET, f"{BASE}/user_has_purchase",
+                      json={"purchased": False, "checkout_pending_seconds": 0,
+                            "conversation_active_seconds": 420},
+                      status=200)
+        result = check_purchase(_purchase_input())
+        assert result.purchased is False
+        assert result.conversation_active_seconds == 420
+        assert result.checkout_pending_seconds == 0
+
+    @pytest.mark.parametrize("body", [
+        True,                                          # bool cru (backend antigo)
+        {"purchased": False, "checkout_pending_seconds": 900},  # backend do T2 (sem o campo)
+        {"purchased": False, "conversation_active_seconds": "x"},
+        {"purchased": False, "conversation_active_seconds": None},
+        {"purchased": False, "conversation_active_seconds": -30},
+    ])
+    @responses.activate
+    def test_conversation_active_ausente_ou_invalido_vira_zero(self, settings_env, body):
+        responses.add(responses.GET, f"{BASE}/user_has_purchase", json=body, status=200)
+        assert check_purchase(_purchase_input()).conversation_active_seconds == 0
+
     def test_dry_run_checkout_pending_zero(self, monkeypatch):
         monkeypatch.setenv("DRY_RUN", "true")
         monkeypatch.setenv("LEGACY_BACKEND_BASE_URL", BASE)
