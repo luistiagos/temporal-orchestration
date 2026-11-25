@@ -47,6 +47,11 @@ CONVERSATION_ACTIVE_STATUS = "conversation_active"  # DispatchResult interno do 
 # (o agente já está atendendo) e os seguintes continuam.
 CONVERSATION_ACTIVE_MAX_ROUNDS = 6
 
+# Falha de step em canal != WhatsApp não para mais o workflow: o step fica
+# registrado em sent_steps com o motivo e o workflow segue para os próximos.
+# docs/modules/remarketing/bugs/2026-11-24-detalhe-do-workflow-mostra-email-como-enviado-sem-destinatario-nem-motivo.md
+STEP_FAILURE_INDEPENDENT_PATCH = "step-failure-independent"
+
 
 def _normalize_window(start_hour: int | None, end_hour: int | None) -> tuple[int, int]:
     """Normaliza (start, end) em horas inteiras BRT. start 0–23, end 1–24, e
@@ -334,47 +339,42 @@ class LeadRemarketingWorkflow:
                         continue
                     break
 
+                # Todo desfecho vira um item de sent_steps (o falho também),
+                # com motivo e destinatário: a tela mostra o que aconteceu com
+                # cada step, não só os que deram certo.
+                sent_at = self._record_step(step, cycle, dispatch_result)
                 if dispatch_result.status in {"sent", "queued", "skipped"}:
-                    sent_at = workflow.now()
-                    idem_key = remarketing_idempotency_key(
-                        payload.tenant_id,
-                        payload.lead_id,
-                        payload.campaign_id,
-                        step.step_id,
-                        cycle,
-                    )
-                    self._state.sent_steps.append(
-                        SentRemarketingStep(
-                            step_id=step.step_id,
-                            channel=step.channel,
-                            cycle=cycle,
-                            status=dispatch_result.status,
-                            idempotency_key=idem_key,
-                            sent_at_iso=sent_at.isoformat(),
-                            provider_message_id=dispatch_result.provider_message_id,
-                            metadata=dispatch_result.raw,
-                        )
-                    )
                     last_dispatched_at_by_step[step.step_id] = sent_at
                     self._state.status = "running"
+                    message = f"{step.channel} step {step.step_id} {dispatch_result.status}"
+                    if dispatch_result.status not in {"sent", "queued"} and dispatch_result.reason:
+                        message += f" — {dispatch_result.reason}"
                     self._add_event(
                         "step_dispatched",
-                        f"{step.channel} step {step.step_id} {dispatch_result.status}",
+                        message,
                         {"step_id": step.step_id, "cycle": cycle},
                     )
                     await self._notify_last_event()
                     continue
 
                 self._state.last_error = dispatch_result.reason
-                self._add_event("step_failed", dispatch_result.reason)
+                self._add_event(
+                    "step_failed",
+                    dispatch_result.reason,
+                    {"step_id": step.step_id, "cycle": cycle},
+                )
                 await self._notify_last_event()
-                # WhatsApp: após 3 retentativas esgotadas, sempre pula o
-                # step e continua o workflow (não interrompe). Outros canais
-                # mantêm o comportamento de `stop_on_step_failure`.
+                # Cada step é independente: a falha de um não para os
+                # seguintes nem o workflow (decisão do dono, 2026-11-24).
+                # WhatsApp sempre foi assim. Os demais canais paravam com
+                # `stop_on_step_failure`; o histórico gravado antes do patch
+                # reexecuta por esse caminho antigo.
                 channel_l = (step.channel or "").strip().lower()
                 if channel_l == "whatsapp":
                     continue
-                if payload.stop_on_step_failure:
+                if payload.stop_on_step_failure and not workflow.patched(
+                    STEP_FAILURE_INDEPENDENT_PATCH
+                ):
                     self._state.status = "failed"
                     return self._state
 
@@ -771,6 +771,35 @@ class LeadRemarketingWorkflow:
                 )
             except asyncio.TimeoutError:
                 return
+
+    def _record_step(self, step, cycle: int, dispatch_result: DispatchResult):
+        """Registra o desfecho do step em sent_steps (qualquer status) e
+        devolve o instante do registro."""
+        assert self._input is not None
+        payload = self._input
+        at = workflow.now()
+        self._state.sent_steps.append(
+            SentRemarketingStep(
+                step_id=step.step_id,
+                channel=step.channel,
+                cycle=cycle,
+                status=dispatch_result.status,
+                idempotency_key=remarketing_idempotency_key(
+                    payload.tenant_id,
+                    payload.lead_id,
+                    payload.campaign_id,
+                    step.step_id,
+                    cycle,
+                ),
+                sent_at_iso=at.isoformat(),
+                provider_message_id=dispatch_result.provider_message_id,
+                metadata=dispatch_result.raw,
+                reason=dispatch_result.reason,
+                recipient=dispatch_result.recipient,
+                recipient_overridden=dispatch_result.recipient_overridden,
+            )
+        )
+        return at
 
     async def _stop_if_requested(self) -> bool:
         if self._purchase_confirmed:

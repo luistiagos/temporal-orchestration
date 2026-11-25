@@ -93,6 +93,10 @@ class DispatchResult:
     retryable: bool = False
     reason: str = ""
     raw: Metadata = field(default_factory=dict)
+    # Destino efetivo da tentativa (e-mail ou telefone, depois de override de
+    # teste) e se ele foi trocado. Default: historico antigo desserializa.
+    recipient: str | None = None
+    recipient_overridden: bool = False
 
 
 @dataclass
@@ -113,6 +117,12 @@ class SentRemarketingStep:
     sent_at_iso: str
     provider_message_id: str | None = None
     metadata: Metadata = field(default_factory=dict)
+    # Todo step despachado entra aqui, inclusive o que nao enviou (status
+    # skipped/failed/...): `reason` diz por que, `recipient` para quem foi a
+    # tentativa. Defaults: estado antigo desserializa.
+    reason: str = ""
+    recipient: str | None = None
+    recipient_overridden: bool = False
 
 
 @dataclass

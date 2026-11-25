@@ -223,16 +223,34 @@ def test_cap_diario_atingido_depois_despacha():
     assert "whatsapp_cap_reached" in event_types
 
 
-def test_email_falha_nao_retryable_para_workflow():
+def test_email_falha_registra_step_e_workflow_segue():
+    """Cada step é independente: a falha do e-mail fica registrada com o
+    motivo e o WhatsApp seguinte sai (antes: workflow `failed` no e-mail)."""
     async def run():
         return await _run(
-            _input([_email_step()], stop_on_step_failure=True),
+            _input([_email_step(), _whatsapp_step()], stop_on_step_failure=True, **_always_open()),
             _make_check_purchase(purchased=False),
-            _make_dispatch([DispatchResult(status="failed", retryable=False, reason="http 500")]),
+            _make_dispatch([
+                DispatchResult(
+                    status="failed", retryable=False,
+                    reason="http 400: INVALID_EMAIL_OR_TEMPLATE",
+                    recipient="lead@example.com",
+                ),
+                DispatchResult(status="sent", recipient="5541985311304"),
+            ]),
         )
 
     result = asyncio.run(run())
-    assert result.status == "failed"
+    assert result.status == "completed"
+    assert [(s.step_id, s.status) for s in result.sent_steps] == [
+        ("email-1", "failed"), ("wpp-1", "sent"),
+    ]
+    email = result.sent_steps[0]
+    assert email.reason == "http 400: INVALID_EMAIL_OR_TEMPLATE"
+    assert email.recipient == "lead@example.com"
+    assert result.sent_steps[1].recipient == "5541985311304"
+    failed = [e for e in result.events if e.event_type == "step_failed"]
+    assert failed and failed[0].metadata == {"step_id": "email-1", "cycle": 1}
 
 
 def test_whatsapp_falha_nao_para_o_workflow():
@@ -246,7 +264,34 @@ def test_whatsapp_falha_nao_para_o_workflow():
 
     result = asyncio.run(run())
     assert result.status == "completed"
-    assert result.sent_steps == []  # falhou, mas não interrompeu
+    # falhou, não interrompeu, e o step aparece com o motivo
+    assert [(s.step_id, s.status, s.reason) for s in result.sent_steps] == [
+        ("wpp-1", "failed", "number_not_exists"),
+    ]
+
+
+def test_email_nao_enviado_por_regra_registra_motivo_e_destinatario():
+    """skipped com motivo: o step guarda reason/recipient/override e o evento
+    não diz só "skipped"."""
+    async def run():
+        return await _run(
+            _input([_email_step()]),
+            _make_check_purchase(purchased=False),
+            _make_dispatch([DispatchResult(
+                status="skipped", reason="user_has_purchase",
+                recipient="dono@example.com", recipient_overridden=True,
+                raw={"ok": True, "sent": False, "reason": "user_has_purchase"},
+            )]),
+        )
+
+    result = asyncio.run(run())
+    assert result.status == "completed"
+    step = result.sent_steps[0]
+    assert (step.status, step.reason, step.recipient, step.recipient_overridden) == (
+        "skipped", "user_has_purchase", "dono@example.com", True,
+    )
+    msgs = [e.message for e in result.events if e.event_type == "step_dispatched"]
+    assert msgs == ["email step email-1 skipped — user_has_purchase"]
 
 
 def test_falha_retryable_retenta_e_depois_envia():
@@ -682,7 +727,10 @@ def test_teto_de_adiamentos_pula_o_step_e_segue():
     ))
 
     assert result.status == "completed"
-    assert result.sent_steps == []
+    # step pulado fica registrado com o motivo (antes: sumia de sent_steps)
+    assert [(s.step_id, s.status, s.reason) for s in result.sent_steps] == [
+        ("wpp-1", "checkout_pending", "checkout_in_progress"),
+    ]
     assert len(_waits(result)) == CHECKOUT_PENDING_MAX_ROUNDS
     assert check.calls["n"] == CHECKOUT_PENDING_MAX_ROUNDS + 1
     assert dispatch.calls["n"] == 1  # teto esgotado: sem 3 retentativas
@@ -895,7 +943,9 @@ def test_teto_de_adiamentos_da_conversa_pula_o_step_e_segue():
     assert len(_conversa_waits(result)) == CONVERSATION_ACTIVE_MAX_ROUNDS
     # 1 dispatch do WhatsApp (teto esgotado, sem 3 retentativas) + 1 do e-mail
     assert dispatch.calls["n"] == 2
-    assert [(s.step_id, s.status) for s in result.sent_steps] == [("email-2", "sent")]
+    assert [(s.step_id, s.status) for s in result.sent_steps] == [
+        ("wpp-1", "conversation_active"), ("email-2", "sent"),
+    ]
     assert [e.message for e in result.events if e.event_type == "step_failed"] == [
         "customer_in_conversation"
     ]
@@ -979,3 +1029,59 @@ def test_replay_de_historico_novo_com_conversa_e_deterministico():
     assert len(_waits(result)) == 1
     assert len(_conversa_waits(result)) == 2
     assert [(s.step_id, s.status) for s in result.sent_steps] == [("wpp-1", "sent")]
+
+
+# ---------------------------------------------------------------------------
+# Steps independentes: falha de e-mail não para o workflow
+# docs/modules/remarketing/bugs/2026-11-24-detalhe-do-workflow-mostra-email-como-enviado-sem-destinatario-nem-motivo.md
+# ---------------------------------------------------------------------------
+
+def test_replay_de_historico_anterior_aos_steps_independentes_e_deterministico():
+    """Histórico gravado pelo código de 1d8e524 (e-mail falha 400 não
+    retentável + WhatsApp; o workflow termina `failed` no e-mail, sem o
+    marcador do patch) reexecuta pelo caminho antigo sem não-determinismo."""
+    history = WorkflowHistory.from_json(
+        "pre-step-independent",
+        (_FIXTURES / "history_pre_step_independent_email_failed.json").read_text(encoding="utf-8"),
+    )
+
+    async def run():
+        await Replayer(workflows=[LeadRemarketingWorkflow]).replay_workflow(history)
+
+    asyncio.run(run())
+
+
+def test_replay_de_historico_novo_com_falha_de_email_e_deterministico():
+    async def run():
+        task_queue = _task_queue()
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                async with Worker(
+                    env.client, task_queue=task_queue,
+                    workflows=[LeadRemarketingWorkflow],
+                    activities=[
+                        _make_check_purchase(purchased=False),
+                        _make_dispatch([
+                            DispatchResult(status="failed", retryable=False, reason="sendmail_failed"),
+                            DispatchResult(status="sent"),
+                        ]),
+                        _mock_notify,
+                    ],
+                    activity_executor=executor,
+                ):
+                    handle = await env.client.start_workflow(
+                        LeadRemarketingWorkflow.run,
+                        _input([_email_step(), _whatsapp_step()], **_always_open()),
+                        id=f"test-{uuid.uuid4().hex}", task_queue=task_queue,
+                        execution_timeout=timedelta(days=2),
+                    )
+                    result = await handle.result()
+                    history = await handle.fetch_history()
+        await Replayer(workflows=[LeadRemarketingWorkflow]).replay_workflow(history)
+        return result
+
+    result = asyncio.run(run())
+    assert result.status == "completed"
+    assert [(s.step_id, s.status) for s in result.sent_steps] == [
+        ("email-1", "failed"), ("wpp-1", "sent"),
+    ]
