@@ -290,6 +290,9 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
 
     dispatch_email = payload.email
     dispatch_phone = payload.phone
+    # Override de teste ativo (test_mode do WhatsApp ou override de e-mail):
+    # o destino efetivo nao e o do lead e a tela precisa dizer isso.
+    recipient_overridden = False
 
     if channel == "whatsapp":
         # Toda a configuração de WhatsApp vem do backend (WhatsAppSenderConfig).
@@ -334,6 +337,7 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
                 payload.phone, override,
             )
             dispatch_phone = override
+            recipient_overridden = True
 
         # Aplica o pacing aleatório min..max (lock global do worker).
         if not payload.bypass_pacing:
@@ -370,6 +374,7 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
         # Modo de teste de email (separado do de WhatsApp).
         if settings.remarketing_email_override_to:
             dispatch_email = settings.remarketing_email_override_to
+            recipient_overridden = True
             logger.info(
                 "email override active: %s -> %s (test mode)",
                 payload.email, dispatch_email,
@@ -403,6 +408,13 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
             reason=f"unsupported channel: {payload.step.channel}",
         )
 
+    # Destino efetivo da tentativa: vai em todo DispatchResult daqui em diante
+    # (os anteriores nao chegaram a tentar nenhum destino).
+    dest = {
+        "recipient": dispatch_email if channel == "email" else dispatch_phone,
+        "recipient_overridden": recipient_overridden,
+    }
+
     try:
         response = _legacy_remarketing_get(
             path,
@@ -414,11 +426,12 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
             status="unknown",
             retryable=False,
             reason=f"timeout after side effect boundary: {exc}",
+            **dest,
         )
     except requests.ConnectionError as exc:
-        return DispatchResult(status="failed", retryable=True, reason=str(exc)[:500])
+        return DispatchResult(status="failed", retryable=True, reason=str(exc)[:500], **dest)
     except requests.RequestException as exc:
-        return DispatchResult(status="failed", retryable=True, reason=str(exc)[:500])
+        return DispatchResult(status="failed", retryable=True, reason=str(exc)[:500], **dest)
 
     raw = response_json_or_raw(response)
 
@@ -439,6 +452,33 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
                 retryable=retryable,
                 reason=reason[:500],
                 raw=raw if isinstance(raw, dict) else {},
+                **dest,
+            )
+
+    # E-mail: o /remarket_v2 responde 200 tambem quando NAO envia, com
+    # ok/sent/reason. sent=false por regra (lead ja comprou, dedup) e skipped;
+    # ok=false (sendmail_failed) e failed NAO retentavel: a email_retry_queue
+    # do backend e a dona da retentativa, retentar aqui enfileiraria em dobro.
+    # Corpo sem "sent" (contrato antigo) segue como sent no bloco abaixo.
+    if channel == "email" and response.status_code == 200 and isinstance(raw, dict):
+        reason = str(raw.get("reason") or "")[:500]
+        if raw.get("ok") is False:
+            logger.info("email dispatch returned ok=false reason=%s", reason)
+            return DispatchResult(
+                status="failed",
+                retryable=False,
+                reason=reason or "email send failed",
+                raw=raw,
+                **dest,
+            )
+        if raw.get("ok") is True and raw.get("sent") is False:
+            logger.info("email dispatch not sent by rule: reason=%s", reason)
+            return DispatchResult(
+                status="skipped",
+                retryable=False,
+                reason=reason or "email not sent",
+                raw=raw,
+                **dest,
             )
 
     if response.status_code in (200, 201, 202):
@@ -455,7 +495,12 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
         if channel == "whatsapp":
             with _dispatch_locks["whatsapp"]:
                 _dispatch_last_sent_at["whatsapp"] = max(_dispatch_last_sent_at["whatsapp"], time.monotonic())
-        return DispatchResult(status=status, provider_message_id=provider_id, raw=raw if isinstance(raw, dict) else {})
+        return DispatchResult(
+            status=status,
+            provider_message_id=provider_id,
+            raw=raw if isinstance(raw, dict) else {},
+            **dest,
+        )
 
     retryable = response.status_code >= 500 or response.status_code == 429
     return DispatchResult(
@@ -463,6 +508,7 @@ def dispatch_remarketing_step(payload: DispatchStepInput) -> DispatchResult:
         retryable=retryable,
         reason=f"http {response.status_code}",
         raw=raw if isinstance(raw, dict) else {},
+        **dest,
     )
 
 

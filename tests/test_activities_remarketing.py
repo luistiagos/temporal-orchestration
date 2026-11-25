@@ -249,9 +249,64 @@ class TestDispatchEmail:
         get_settings.cache_clear()
         responses.add(responses.GET, f"{BASE}/remarket_v2",
                       json={"ok": True}, status=200)
-        dispatch_remarketing_step(_dispatch_input("email"))
+        result = dispatch_remarketing_step(_dispatch_input("email"))
         url = responses.calls[0].request.url
         assert "override%40teste.com" in url or "override@teste.com" in url
+        assert result.recipient == "override@teste.com"
+        assert result.recipient_overridden is True
+
+    # T2 (docs/modules/remarketing/bugs/2026-11-24-detalhe-do-workflow-mostra-
+    # email-como-enviado-sem-destinatario-nem-motivo.md): o /remarket_v2 diz
+    # em HTTP 200 se enviou (ok/sent/reason); a activity tem de ler.
+    @responses.activate
+    def test_email_200_sent_true_vira_sent_com_destinatario_do_lead(self, settings_env):
+        responses.add(responses.GET, f"{BASE}/remarket_v2",
+                      json={"ok": True, "reason": "sent", "sent": True}, status=200)
+        result = dispatch_remarketing_step(_dispatch_input("email"))
+        assert result.status == "sent"
+        assert result.recipient == "emuladores.emuladores@gmail.com"
+        assert result.recipient_overridden is False
+
+    @pytest.mark.parametrize("reason", ["user_has_purchase", "lead_status_purchase",
+                                        "already_sent_dedup"])
+    @responses.activate
+    def test_email_200_nao_enviado_por_regra_vira_skipped_com_motivo(self, settings_env, reason):
+        responses.add(responses.GET, f"{BASE}/remarket_v2",
+                      json={"ok": True, "reason": reason, "sent": False}, status=200)
+        result = dispatch_remarketing_step(_dispatch_input("email"))
+        assert result.status == "skipped"
+        assert result.reason == reason
+        assert result.retryable is False
+        assert result.recipient == "emuladores.emuladores@gmail.com"
+
+    @responses.activate
+    def test_email_200_sendmail_failed_vira_failed_nao_retentavel(self, settings_env):
+        # A email_retry_queue do backend e a dona da retentativa.
+        responses.add(responses.GET, f"{BASE}/remarket_v2",
+                      json={"ok": False, "reason": "sendmail_failed", "sent": False},
+                      status=200)
+        result = dispatch_remarketing_step(_dispatch_input("email"))
+        assert result.status == "failed"
+        assert result.retryable is False
+        assert result.reason == "sendmail_failed"
+        assert result.recipient == "emuladores.emuladores@gmail.com"
+
+    @responses.activate
+    def test_email_200_sem_campo_sent_segue_sent(self, settings_env):
+        # Contrato antigo (corpo sem "sent"): nada muda.
+        responses.add(responses.GET, f"{BASE}/remarket_v2",
+                      json={"ok": True}, status=200)
+        result = dispatch_remarketing_step(_dispatch_input("email"))
+        assert result.status == "sent"
+
+    @responses.activate
+    def test_email_falha_http_leva_destinatario(self, settings_env):
+        responses.add(responses.GET, f"{BASE}/remarket_v2",
+                      json={"error": "x"}, status=500)
+        result = dispatch_remarketing_step(_dispatch_input("email"))
+        assert result.status == "failed"
+        assert result.recipient == "emuladores.emuladores@gmail.com"
+        assert result.recipient_overridden is False
 
 
 # ===========================================================================
@@ -319,10 +374,33 @@ class TestDispatchWhatsApp:
                       status=200)
         responses.add(responses.GET, f"{BASE}/remarket_whatsapp_ai",
                       json={"ok": True}, status=200)
-        dispatch_remarketing_step(_dispatch_input("whatsapp"))
+        result = dispatch_remarketing_step(_dispatch_input("whatsapp"))
         # 2 chamadas: snapshot e o envio. A última carrega o telefone de teste.
         send_url = responses.calls[-1].request.url
         assert "5541985311304" in send_url
+        assert result.recipient == "5541985311304"
+        assert result.recipient_overridden is True
+
+    @responses.activate
+    def test_whatsapp_sem_modo_teste_leva_telefone_do_lead(self, settings_env):
+        responses.add(responses.GET, f"{BASE}/admin/wpp-sender/snapshot",
+                      json=self._snapshot(), status=200)
+        responses.add(responses.GET, f"{BASE}/remarket_whatsapp_ai",
+                      json={"ok": False, "retryable": False, "reason": "number_not_exists"},
+                      status=200)
+        result = dispatch_remarketing_step(_dispatch_input("whatsapp"))
+        assert result.status == "failed"
+        assert result.recipient == "(41) 98531-1304"
+        assert result.recipient_overridden is False
+
+    @responses.activate
+    def test_whatsapp_desabilitado_nao_leva_destinatario(self, settings_env):
+        # Retorno anterior a troca de destino: nenhuma tentativa, nenhum destino.
+        responses.add(responses.GET, f"{BASE}/admin/wpp-sender/snapshot",
+                      json=self._snapshot(enabled=False), status=200)
+        result = dispatch_remarketing_step(_dispatch_input("whatsapp"))
+        assert result.status == "skipped"
+        assert result.recipient is None
 
 
 # ===========================================================================
