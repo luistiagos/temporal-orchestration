@@ -32,6 +32,7 @@ class RemarketingStepRequest(BaseModel):
     preferred_day: int | None = None
     repeat_after_days: int | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    delay_from_previous: bool = False
 
     def to_dataclass(self) -> RemarketingStep:
         return RemarketingStep(**self.model_dump())

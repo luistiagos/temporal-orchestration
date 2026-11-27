@@ -198,6 +198,9 @@ class LeadRemarketingWorkflow:
                     break
 
             self._state.current_cycle = cycle
+            # Instante do registro do step anterior NESTE ciclo (qualquer
+            # desfecho): base do step relativo. None = ainda nao houve anterior.
+            previous_recorded_at = None
             for step in cycle_sequence:
                 if await self._stop_if_requested():
                     return self._state
@@ -206,6 +209,13 @@ class LeadRemarketingWorkflow:
                 self._state.status = "waiting"
                 base_at = cycle_anchor
                 delay_minutes = step.delay_minutes
+                send_at_iso = step.send_at_iso if cycle == 1 else None
+                # Step relativo: conta do registro do anterior, nunca do horario
+                # explicito. Sem anterior (e o primeiro), conta do lead. Ramo so
+                # entra com o campo verdadeiro: historico antigo nao passa aqui.
+                if cycle == 1 and getattr(step, "delay_from_previous", False):
+                    base_at = previous_recorded_at or cycle_anchor
+                    send_at_iso = None
                 if cycle > 1:
                     base_at = last_dispatched_at_by_step.get(step.step_id, workflow.now())
                     delay_minutes = int(step.repeat_after_days or 0) * 24 * 60
@@ -214,7 +224,7 @@ class LeadRemarketingWorkflow:
                     now=workflow.now(),
                     base_at=base_at,
                     delay_minutes=delay_minutes,
-                    send_at_iso=step.send_at_iso if cycle == 1 else None,
+                    send_at_iso=send_at_iso,
                     preferred_time=step.preferred_time,
                     preferred_day=step.preferred_day,
                 )
@@ -343,6 +353,7 @@ class LeadRemarketingWorkflow:
                 # com motivo e destinatário: a tela mostra o que aconteceu com
                 # cada step, não só os que deram certo.
                 sent_at = self._record_step(step, cycle, dispatch_result)
+                previous_recorded_at = sent_at
                 if dispatch_result.status in {"sent", "queued", "skipped"}:
                     last_dispatched_at_by_step[step.step_id] = sent_at
                     self._state.status = "running"

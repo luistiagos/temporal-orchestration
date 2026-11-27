@@ -20,6 +20,11 @@ class RemarketingStep:
     preferred_day: int | None = None
     repeat_after_days: int | None = None
     metadata: Metadata = field(default_factory=dict)
+    # True: no ciclo 1 o atraso conta do registro do step anterior da sequencia
+    # (enviado, pulado ou falho), e `send_at_iso` e ignorado. Ausente/False: como
+    # sempre foi. Historico antigo decodifica False.
+    # docs/modules/remarketing/changes/2026-11-27-step-de-cupom-uma-hora-depois-do-whatsapp/design.md
+    delay_from_previous: bool = False
 
 
 @dataclass

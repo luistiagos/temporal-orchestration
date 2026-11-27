@@ -1085,3 +1085,233 @@ def test_replay_de_historico_novo_com_falha_de_email_e_deterministico():
     assert [(s.step_id, s.status) for s in result.sent_steps] == [
         ("email-1", "failed"), ("wpp-1", "sent"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Step relativo ao anterior (step de cupom uma hora depois do WhatsApp)
+# docs/modules/remarketing/changes/2026-11-27-step-de-cupom-uma-hora-depois-do-whatsapp/spec.md
+#
+# O step relativo recebe um `send_at_iso` de proposito: sem ele,
+# `compute_due_at` ja usa max(base, now) e o teste passaria no codigo antigo.
+# ---------------------------------------------------------------------------
+
+from datetime import UTC, datetime
+
+from dsg_temporal.schedule import parse_iso_datetime
+
+
+def _cupom_step(*, delay_minutes=60, send_at_iso=None, relative=True, order=3):
+    return RemarketingStep(
+        step_id="wpp-cupom", order=order, channel="whatsapp",
+        template="remarket/wpp_remarket_cupom_ps2.txt", delay_minutes=delay_minutes,
+        send_at_iso=send_at_iso, delay_from_previous=relative,
+    )
+
+
+def _wpp2(step_id="wpp-2"):
+    return RemarketingStep(step_id=step_id, order=2, channel="whatsapp", template="oi",
+                           delay_minutes=1)
+
+
+def _sent_at(result, step_id):
+    return [parse_iso_datetime(s.sent_at_iso) for s in result.sent_steps if s.step_id == step_id]
+
+
+def _inicio(result):
+    return next(parse_iso_datetime(e.at_iso) for e in result.events
+                if e.event_type == "workflow_started")
+
+
+def _iso_em(minutos):
+    """Instante absoluto como o planner manda (lead + atraso), a partir do relogio de agora:
+    o ambiente time-skipping comeca no relogio real."""
+    return (datetime.now(UTC) + timedelta(minutes=minutos)).isoformat()
+
+
+def test_step_relativo_ao_anterior_conta_do_despacho_anterior():
+    """EARS-1: o anterior so despacha 30 min depois (pacing); o relativo sai 60 min
+    depois do REGISTRO do anterior, nao no send_at_iso (lead + 60)."""
+    calls = []
+
+    @activity.defn(name="dispatch_remarketing_step")
+    def _dispatch(payload: DispatchStepInput) -> DispatchResult:
+        calls.append(payload.step.step_id)
+        if len(calls) == 1:
+            return DispatchResult(status="pacing_required", raw={"wait_seconds": 30 * 60})
+        return DispatchResult(status="sent")
+
+    async def run():
+        return await _run(
+            _input([_wpp2(), _cupom_step(send_at_iso=_iso_em(60))], **_always_open()),
+            _make_check_purchase(purchased=False),
+            _dispatch,
+        )
+
+    result = asyncio.run(run())
+    assert result.status == "completed"
+    (anterior,) = _sent_at(result, "wpp-2")
+    (cupom,) = _sent_at(result, "wpp-cupom")
+    assert anterior - _inicio(result) >= timedelta(minutes=30)
+    assert cupom - anterior >= timedelta(minutes=60)
+    assert cupom - anterior < timedelta(minutes=61)
+
+
+def test_step_relativo_conta_mesmo_com_o_anterior_falho():
+    """EARS-1: falho tambem conta como despacho do anterior."""
+    @activity.defn(name="dispatch_remarketing_step")
+    def _dispatch(payload: DispatchStepInput) -> DispatchResult:
+        if payload.step.step_id == "wpp-2":
+            return DispatchResult(status="failed", retryable=False, reason="numero_inexistente")
+        return DispatchResult(status="sent")
+
+    async def run():
+        return await _run(
+            _input([_wpp2(), _cupom_step(send_at_iso=_iso_em(1))], **_always_open()),
+            _make_check_purchase(purchased=False),
+            _dispatch,
+        )
+
+    result = asyncio.run(run())
+    assert [(s.step_id, s.status) for s in result.sent_steps] == [
+        ("wpp-2", "failed"), ("wpp-cupom", "sent"),
+    ]
+    assert _sent_at(result, "wpp-cupom")[0] - _sent_at(result, "wpp-2")[0] >= timedelta(minutes=60)
+
+
+def test_step_relativo_conta_depois_do_adiamento_da_janela():
+    """EARS-2: o anterior e adiado pela janela (12 h de pacing > 11 h de janela 09-20
+    cruza o fim sempre); o relativo conta do despacho real, depois do adiamento."""
+    calls = []
+
+    @activity.defn(name="dispatch_remarketing_step")
+    def _dispatch(payload: DispatchStepInput) -> DispatchResult:
+        calls.append(payload.step.step_id)
+        if len(calls) == 1:
+            return DispatchResult(status="pacing_required", raw={"wait_seconds": 12 * 3600})
+        return DispatchResult(status="sent")
+
+    async def run():
+        return await _run(
+            _input([_wpp2(), _cupom_step(delay_minutes=60, send_at_iso=_iso_em(60))],
+                   window_start_hour=9, window_end_hour=20),
+            _make_check_purchase(purchased=False),
+            _dispatch,
+            timeout_days=4,
+        )
+
+    result = asyncio.run(run())
+    assert result.status == "completed"
+    event_types = [e.event_type for e in result.events]
+    assert "send_window_wait" in event_types
+    anterior = _sent_at(result, "wpp-2")[0]
+    cupom = _sent_at(result, "wpp-cupom")[0]
+    assert anterior - _inicio(result) >= timedelta(hours=12)
+    assert cupom - anterior >= timedelta(minutes=60)
+
+
+def test_step_relativo_respeita_a_janela():
+    """EARS-3: 12 h depois do anterior pode cair fora de 09-20 BRT; o relativo sai sempre
+    dentro da janela e nunca antes do atraso."""
+    async def run():
+        return await _run(
+            _input([_wpp2(), _cupom_step(delay_minutes=12 * 60, send_at_iso=_iso_em(1))],
+                   window_start_hour=9, window_end_hour=20),
+            _make_check_purchase(purchased=False),
+            _make_dispatch([DispatchResult(status="sent")]),
+            timeout_days=4,
+        )
+
+    result = asyncio.run(run())
+    assert result.status == "completed"
+    anterior = _sent_at(result, "wpp-2")[0]
+    cupom = _sent_at(result, "wpp-cupom")[0]
+    assert cupom - anterior >= timedelta(hours=12)
+    hora_brt = (cupom - timedelta(hours=3)).hour
+    assert 9 <= hora_brt < 20
+
+
+def test_step_relativo_nao_envia_apos_compra():
+    """EARS-5: comprou entre o anterior e o relativo -> purchased, cupom nao despacha."""
+    dispatch = _make_dispatch([DispatchResult(status="sent")])
+
+    async def run():
+        return await _run(
+            _input([_wpp2(), _cupom_step(send_at_iso=_iso_em(60))], **_always_open()),
+            _make_check_sequence([(False, 0), (True, 0)]),
+            dispatch,
+        )
+
+    result = asyncio.run(run())
+    assert result.status == "purchased"
+    assert [s.step_id for s in result.sent_steps] == ["wpp-2"]
+    assert dispatch.calls["n"] == 1
+
+
+def test_step_relativo_primeiro_da_sequencia_conta_do_lead():
+    """Sem anterior, o relativo conta da criacao do lead (cycle_anchor), nao do send_at_iso."""
+    async def run():
+        return await _run(
+            _input([_cupom_step(delay_minutes=60, send_at_iso=_iso_em(5), order=1)],
+                   **_always_open()),
+            _make_check_purchase(purchased=False),
+            _make_dispatch([DispatchResult(status="sent")]),
+        )
+
+    result = asyncio.run(run())
+    assert _sent_at(result, "wpp-cupom")[0] - _inicio(result) >= timedelta(minutes=60)
+
+
+def test_step_absoluto_inalterado():
+    """EARS-4: sem a flag, o send_at_iso explicito continua vencendo (sai em ~5 min,
+    mesmo com delay de 60)."""
+    async def run():
+        return await _run(
+            _input([_wpp2(), _cupom_step(send_at_iso=_iso_em(5), relative=False)],
+                   **_always_open()),
+            _make_check_purchase(purchased=False),
+            _make_dispatch([DispatchResult(status="sent")]),
+        )
+
+    result = asyncio.run(run())
+    assert _sent_at(result, "wpp-cupom")[0] - _inicio(result) < timedelta(minutes=30)
+
+
+def test_api_aceita_o_campo_e_o_ausente_vira_falso():
+    # api.py importa fastapi no topo; o CI instala `.[dev]`, a maquina local pode nao ter.
+    pytest.importorskip("fastapi")
+    from dsg_temporal.api import RemarketingStepRequest
+
+    base = dict(step_id="1", order=1, channel="whatsapp", template="t")
+    assert RemarketingStepRequest(**base).to_dataclass().delay_from_previous is False
+    assert RemarketingStepRequest(**base, delay_from_previous=True).to_dataclass().delay_from_previous is True
+
+
+def test_replay_de_historico_novo_com_step_relativo_e_deterministico():
+    async def run():
+        task_queue = _task_queue()
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                async with Worker(
+                    env.client, task_queue=task_queue,
+                    workflows=[LeadRemarketingWorkflow],
+                    activities=[
+                        _make_check_purchase(purchased=False),
+                        _make_dispatch([DispatchResult(status="sent")]),
+                        _mock_notify,
+                    ],
+                    activity_executor=executor,
+                ):
+                    handle = await env.client.start_workflow(
+                        LeadRemarketingWorkflow.run,
+                        _input([_email_step(), _wpp2(), _cupom_step(send_at_iso=_iso_em(60))],
+                               **_always_open()),
+                        id=f"test-{uuid.uuid4().hex}", task_queue=task_queue,
+                        execution_timeout=timedelta(days=2),
+                    )
+                    result = await handle.result()
+                    history = await handle.fetch_history()
+        await Replayer(workflows=[LeadRemarketingWorkflow]).replay_workflow(history)
+        return result
+
+    result = asyncio.run(run())
+    assert [s.step_id for s in result.sent_steps] == ["email-1", "wpp-2", "wpp-cupom"]
