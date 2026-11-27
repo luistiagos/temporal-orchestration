@@ -16,6 +16,7 @@ from dsg_temporal.schemas import (
     WhatsAppWorkflowInput,
 )
 from dsg_temporal.settings import get_settings
+from dsg_temporal.whatsapp_ingest import deliver_whatsapp_message
 from dsg_temporal.workflows import LeadRemarketingWorkflow, WhatsAppConversationWorkflow
 
 
@@ -353,7 +354,7 @@ async def retry_current_step(workflow_id: str, request: Request) -> dict[str, st
 async def ingest_whatsapp_message(
     payload: WhatsAppMessageRequest,
     request: Request,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     settings = get_settings()
     conversation_id = (
         canonical_phone(payload.jid)
@@ -375,19 +376,14 @@ async def ingest_whatsapp_message(
         metadata=payload.metadata,
     )
 
-    client = temporal_client(request)
-    try:
-        await client.start_workflow(
-            WhatsAppConversationWorkflow.run,
-            workflow_input,
-            id=workflow_id,
-            task_queue=settings.temporal_task_queue,
-        )
-        return {"workflow_id": workflow_id, "status": "started"}
-    except WorkflowAlreadyStartedError:
-        handle = client.get_workflow_handle(workflow_id)
-        await handle.signal(WhatsAppConversationWorkflow.message_received, message)
-        return {"workflow_id": workflow_id, "status": "signaled"}
+    # `started` | `restarted` (run preso trocado; o backend alerta) | `signaled`.
+    return await deliver_whatsapp_message(
+        temporal_client(request),
+        workflow_id=workflow_id,
+        workflow_input=workflow_input,
+        message=message,
+        task_queue=settings.temporal_task_queue,
+    )
 
 
 @app.get("/v1/whatsapp/workflows/{workflow_id}")

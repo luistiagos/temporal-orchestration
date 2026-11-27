@@ -215,6 +215,54 @@ async def diagnose_workflow(
     return result
 
 
+async def terminate_run(
+    client: Client, workflow_id: str, run_id: str, reason: str
+) -> dict[str, Any]:
+    """Termina UM run especifico. Handle com `run_id` manda esse run_id no terminate
+    (`WorkflowHandle.terminate` usa `self._run_id`): nunca mata um run mais novo do
+    mesmo `workflow_id`, iniciado por uma requisicao concorrente. Run ja fechado (ou
+    inexistente) devolve `not_found` em vez de levantar."""
+    handle = client.get_workflow_handle(workflow_id, run_id=run_id)
+    try:
+        await handle.terminate(reason=reason)
+    except Exception as exc:
+        if is_not_found(exc):
+            return {"workflow_id": workflow_id, "run_id": run_id, "status": "not_found"}
+        raise
+    return {"workflow_id": workflow_id, "run_id": run_id, "status": "terminated"}
+
+
+async def terminate_if_stuck(
+    client: Client, workflow_id: str, reason: str
+) -> dict[str, Any] | None:
+    """Termina o run ATUAL do workflow se ele estiver PRESO; senao nao faz nada.
+
+    Devolve `None` quando o workflow nao existe ou nao esta preso (custo: um
+    `describe`, sem ler historico). Preso -> termina aquele run pelo `run_id`
+    descrito e devolve `{"previous_run_id", "attempt", "terminate"}`. Se outro
+    request ja tinha terminado o run (`not_found` no terminate), devolve o dict do
+    mesmo jeito: o run preso esta encerrado, e quem chama pode iniciar o novo.
+
+    Uso: `whatsapp_ingest.deliver_whatsapp_message`, antes do signal. Doc:
+    docs/modules/chatbot-whatsapp/bugs/2026-11-27-mensagem-aceita-como-signaled-por-workflow-preso-se-perde-sem-alerta.md
+    """
+    try:
+        desc = await client.get_workflow_handle(workflow_id).describe()
+    except Exception as exc:
+        if is_not_found(exc):
+            return None
+        raise
+
+    status = int(desc.status) if desc.status is not None else None
+    attempt = int(desc.raw_description.pending_workflow_task.attempt or 0)
+    if verdict_for(status, attempt) != VERDICT_STUCK:
+        return None
+
+    run_id = desc.raw_description.workflow_execution_info.execution.run_id
+    killed = await terminate_run(client, workflow_id, run_id, reason)
+    return {"previous_run_id": run_id, "attempt": attempt, "terminate": killed["status"]}
+
+
 async def terminate_workflow(client: Client, workflow_id: str, reason: str) -> dict[str, Any]:
     """Termina o workflow. E' o unico jeito de libertar o `workflow_id` de um
     workflow PRESO: `cancel` e `pause` sao SIGNAL, e signal depende do workflow
